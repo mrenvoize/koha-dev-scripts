@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# koha-feature-up <feature-name>
+# Creates (or attaches) a worktree under $KOHA_DIR/core/worktrees/<feature>
+# and brings up a KTD instance for it.
+#
+# If a branch named <feature-name> already exists (e.g. main, 24.11.wscc),
+# the worktree checks it out. Otherwise a new branch is created from main.
+#
+# URLs (only if *.kohadev.home DNS resolves on this machine):
+#   OPAC:  http://<feature>.kohadev.home
+#   Staff: http://<feature>-intra.kohadev.home
+
+set -e
+
+NAME="$1"
+if [ -z "$NAME" ]; then
+    echo "usage: $0 <feature-name>" >&2
+    exit 1
+fi
+
+KOHA_DIR="${KOHA_DIR:-$HOME/Projects/koha}"
+WORKTREE="$KOHA_DIR/core/worktrees/$NAME"
+BARE="$KOHA_DIR/core/koha.git"
+
+# Map branch name → Docker-safe project name + KOHA_IMAGE.
+# Versioned branches (NN.NN.TAG, e.g. 24.11.etf) → TAG+MAJOR (etf24) + KOHA_IMAGE=24.11
+# All other branches (bug_1234, main, …) → unchanged
+if [[ "$NAME" =~ ^([0-9]+)\.([0-9]+)\.(.+)$ ]]; then
+    KTD_NAME="${BASH_REMATCH[3]}${BASH_REMATCH[1]}"
+    export KOHA_IMAGE="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+else
+    KTD_NAME="$NAME"
+fi
+
+if [ ! -d "$BARE" ]; then
+    echo "error: bare repo not found at $BARE" >&2
+    echo "       set KOHA_DIR or check your layout" >&2
+    exit 1
+fi
+
+export KTD_HOME="${KTD_HOME:-$KOHA_DIR/tooling/koha-testing-docker}"
+export LOCAL_USER_ID="$(id -u)"
+export LOCAL_GROUP_ID="$(id -g)"
+
+if [ ! -d "$WORKTREE" ]; then
+    if git -C "$BARE" show-ref --verify --quiet "refs/heads/$NAME"; then
+        echo "branch $NAME exists — checking it out as a worktree"
+        git -C "$BARE" worktree add "$WORKTREE" "$NAME"
+    else
+        echo "creating new branch $NAME from main"
+        git -C "$BARE" worktree add "$WORKTREE" -b "$NAME" main
+    fi
+fi
+
+# Ensure the shared traefik proxy is running (idempotent)
+if ! docker ps --format '{{.Names}}' | grep -q '^proxy-proxy-1$'; then
+    echo "starting ktd_proxy..."
+    ktd_proxy --start
+fi
+
+export SYNC_REPO="$WORKTREE"
+export KTD_INSTANCE="$KTD_NAME"
+cd "$WORKTREE"
+
+echo "bringing up KTD instance: $KTD_NAME"
+ktd --proxy --name "$KTD_NAME" up -d
+
+cat <<EOF
+
+KTD instance '$KTD_NAME' is up.
+  OPAC:     http://$KTD_NAME.kohadev.home          (requires *.kohadev.home DNS)
+  Staff:    http://$KTD_NAME-intra.kohadev.home
+  Worktree: $WORKTREE
+EOF

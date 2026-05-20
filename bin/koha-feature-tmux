@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# koha-feature-tmux <feature-name>
+# Attaches (or creates) a tmux session for the given feature with two windows:
+#   Window 1 "container": docker logs (left) | ktd shell (right)
+#   Window 2 "dev":       claude (left)      | empty term in worktree (right)
+# Assumes the KTD instance is already up (run koha-feature-up first).
+#
+# Exports KTD_INSTANCE=<feature> into the tmux env so commands like
+# `ktd --name "$KTD_INSTANCE" --shell --run '...'` resolve correctly.
+
+set -e
+
+NAME="$1"
+if [ -z "$NAME" ]; then
+    echo "usage: $0 <feature-name>" >&2
+    exit 1
+fi
+
+KOHA_DIR="${KOHA_DIR:-$HOME/Projects/koha}"
+WORKTREE="$KOHA_DIR/core/worktrees/$NAME"
+if [ ! -d "$WORKTREE" ]; then
+    echo "worktree $WORKTREE does not exist; run koha-feature-up $NAME first" >&2
+    exit 1
+fi
+
+# Map branch name → Docker-safe project name (mirrors koha-feature-up logic)
+# Also use KTD_NAME for the tmux session to avoid dots in target references
+if [[ "$NAME" =~ ^([0-9]+)\.([0-9]+)\.(.+)$ ]]; then
+    KTD_NAME="${BASH_REMATCH[3]}${BASH_REMATCH[1]}"
+else
+    KTD_NAME="$NAME"
+fi
+
+SESSION="koha-$KTD_NAME"
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    exec tmux attach -t "$SESSION"
+fi
+
+# Pass feature-specific env into the new session so panes inherit it.
+TMUX_ENV=(
+    -e "KTD_INSTANCE=$KTD_NAME"
+    -e "SYNC_REPO=$WORKTREE"
+)
+
+# Window 1: container visibility
+tmux new-session -d -s "$SESSION" -c "$WORKTREE" -n "container" \
+    "${TMUX_ENV[@]}" "docker logs -f ${KTD_NAME}-koha-1"
+tmux split-window -h -t "$SESSION:container" -c "$WORKTREE" \
+    "ktd --shell --name $KTD_NAME"
+tmux select-pane -t "$SESSION:container.1"
+
+# Window 2: development
+tmux new-window -t "$SESSION" -n "dev" -c "$WORKTREE" "claude"
+tmux split-window -h -t "$SESSION:dev" -c "$WORKTREE"
+tmux select-pane -t "$SESSION:dev.1"
+
+# Land on the dev window, claude pane
+tmux select-window -t "$SESSION:dev"
+
+exec tmux attach -t "$SESSION"

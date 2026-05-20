@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# koha-feature-down <feature-name> [--remove-worktree]
+# Tears down the KTD instance for <feature-name>. By default keeps the
+# worktree directory; pass --remove-worktree to remove it on disk.
+
+set -e
+
+NAME="$1"
+if [ -z "$NAME" ]; then
+    echo "usage: $0 <feature-name> [--remove-worktree]" >&2
+    exit 1
+fi
+
+REMOVE_WORKTREE="no"
+if [ "$2" = "--remove-worktree" ]; then
+    REMOVE_WORKTREE="yes"
+fi
+
+KOHA_DIR="${KOHA_DIR:-$HOME/Projects/koha}"
+export KTD_HOME="${KTD_HOME:-$KOHA_DIR/tooling/koha-testing-docker}"
+
+# Map branch name → Docker-safe project name (mirrors koha-feature-up logic)
+if [[ "$NAME" =~ ^([0-9]+)\.([0-9]+)\.(.+)$ ]]; then
+    KTD_NAME="${BASH_REMATCH[3]}${BASH_REMATCH[1]}"
+else
+    KTD_NAME="$NAME"
+fi
+
+echo "bringing down KTD instance: $KTD_NAME"
+ktd down "$KTD_NAME" || true
+
+WORKTREE="$KOHA_DIR/core/worktrees/$NAME"
+if [ "$REMOVE_WORKTREE" = "yes" ] && [ -d "$WORKTREE" ]; then
+    echo "removing worktree $WORKTREE"
+    git -C "$KOHA_DIR/core/koha.git" worktree remove --force "$WORKTREE" || rm -rf "$WORKTREE"
+fi
+
+echo "done."
