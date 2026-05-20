@@ -6,6 +6,17 @@
 # If a branch named <feature-name> already exists (e.g. main, 24.11.wscc),
 # the worktree checks it out. Otherwise a new branch is created from main.
 #
+# Versioned branches (NN.NN.TAG) automatically set KOHA_IMAGE=NN.NN.
+#
+# Options (passed through to ktd):
+#   --plugin PATH        Mount a single plugin dir (ktd --single-plugin PATH)
+#   --plugins            Enable full plugin dev environment
+#   --search-engine ENG  Use a specific search engine
+#   --selenium           Add Selenium container
+#   --smtp               Add SMTP container
+#   --sso                Add Keycloak/SSO container
+#   --persistent-db      Make this instance's DB persistent
+#
 # URLs (only if *.kohadev.home DNS resolves on this machine):
 #   OPAC:  http://<feature>.kohadev.home
 #   Staff: http://<feature>-intra.kohadev.home
@@ -14,9 +25,36 @@ set -e
 
 NAME="$1"
 if [ -z "$NAME" ]; then
-    echo "usage: $0 <feature-name>" >&2
+    echo "usage: $0 <feature-name> [--plugin PATH|--plugins] [--search-engine ENGINE] [--selenium] [--smtp] [--sso] [--persistent-db]" >&2
     exit 1
 fi
+shift
+
+# Parse optional flags to pass through to ktd
+KTD_EXTRA_FLAGS=()
+PLUGIN_PATH=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --plugin)
+        PLUGIN_PATH="$(realpath "$2")"
+        KTD_EXTRA_FLAGS+=(--single-plugin "$PLUGIN_PATH")
+        shift 2
+        ;;
+    --plugins | --selenium | --smtp | --sso | --persistent-db)
+        KTD_EXTRA_FLAGS+=("$1")
+        shift
+        ;;
+    --search-engine)
+        KTD_EXTRA_FLAGS+=(--search-engine "$2")
+        shift 2
+        ;;
+    *)
+        echo "unknown option: $1" >&2
+        exit 1
+        ;;
+    esac
+done
 
 KOHA_DIR="${KOHA_DIR:-$HOME/Projects/koha}"
 WORKTREE="$KOHA_DIR/core/worktrees/$NAME"
@@ -52,6 +90,12 @@ if [ ! -d "$WORKTREE" ]; then
     fi
 fi
 
+# Pre-create the remember plugin's log dir so its hooks don't error on first
+# run in a fresh worktree. See: claude-plugins-official/remember bug — hooks.json
+# uses `2>> .remember/logs/hook-errors.log` and the shell opens the redirect
+# before the session-start script can mkdir the directory.
+mkdir -p "$WORKTREE/.remember/logs"
+
 # Ensure the shared traefik proxy is running (idempotent)
 if ! docker ps --format '{{.Names}}' | grep -q '^proxy-proxy-1$'; then
     echo "starting ktd_proxy..."
@@ -63,7 +107,7 @@ export KTD_INSTANCE="$KTD_NAME"
 cd "$WORKTREE"
 
 echo "bringing up KTD instance: $KTD_NAME"
-ktd --proxy --name "$KTD_NAME" up -d
+ktd --proxy --name "$KTD_NAME" "${KTD_EXTRA_FLAGS[@]}" up -d
 
 cat <<EOF
 
@@ -72,3 +116,5 @@ KTD instance '$KTD_NAME' is up.
   Staff:    http://$KTD_NAME-intra.kohadev.home
   Worktree: $WORKTREE
 EOF
+[ -n "$PLUGIN_PATH" ] && echo "  Plugin:   $PLUGIN_PATH"
+true
