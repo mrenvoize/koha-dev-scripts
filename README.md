@@ -1,29 +1,46 @@
-# koha-scripts
+# koha-dev-scripts
 
-Personal Koha development workflow scripts. Each script lives in `bin/` and is installed via symlink.
+Personal Koha development workflow scripts. A single `kd` command wraps git worktree and KTD instance management.
 
-## Scripts
+## Usage
+
+```
+kd up <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
+             [--selenium] [--smtp] [--sso] [--persistent-db]
+kd down <name> [--rm]
+kd tmux <name>
+kd shell <name> [--root] [--run 'cmd']
+kd logs <name>
+kd list
+kd proxy [start|stop|status]
+```
 
 | Command | Purpose |
 |---------|---------|
-| `koha-feature-up <name>` | Create/attach a worktree and bring up a KTD instance |
-| `koha-feature-down <name> [--remove-worktree]` | Tear down a KTD instance, optionally remove the worktree |
-| `koha-feature-tmux <name>` | Attach/create a tmux session with container and dev windows |
+| `kd up` | Create worktree (if needed) and start a KTD instance |
+| `kd down` | Stop a KTD instance; `--rm` also removes the worktree |
+| `kd tmux` | Attach or create a tmux dev session (container + dev windows) |
+| `kd shell` | Drop into the KTD container shell |
+| `kd logs` | Follow the KTD container logs |
+| `kd list` | Show all worktrees with KTD container name and status |
+| `kd proxy` | Manage the shared Traefik proxy |
+
+Versioned branch names (`NN.NN.TAG`, e.g. `24.11.etf`) are automatically mapped to a Docker-safe project name (`etf24`) and the correct `KOHA_IMAGE`.
 
 ## Install
 
 ```bash
-git clone <repo-url> ~/Projects/koha-scripts
-~/Projects/koha-scripts/install.sh
+git clone <repo-url> ~/Projects/koha/tooling/koha-dev-scripts
+~/Projects/koha/tooling/koha-dev-scripts/install.sh
 ```
 
-Re-run `install.sh` after adding new scripts — it symlinks everything in `bin/` into `~/.local/bin/`.
+Re-run `install.sh` after pulling — it symlinks everything in `bin/` into `~/.local/bin/` and removes any legacy `koha-feature-*` symlinks.
 
 ## Sync between machines
 
 ```bash
-git pull          # pull changes
-./install.sh      # re-link (new scripts, renamed scripts, etc.)
+git pull
+./install.sh
 ```
 
 ## Dependencies
@@ -31,7 +48,7 @@ git pull          # pull changes
 - `ktd` / `ktd_proxy` — [koha-testing-docker](https://gitlab.com/koha-community/koha-testing-docker)
 - `docker`
 - `tmux`
-- `claude` (for the dev window in `koha-feature-tmux`)
+- `claude` (for the dev window in `kd tmux`)
 
 ## Environment
 

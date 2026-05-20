@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# kd — Koha dev workflow wrapper
+# Manages git worktrees and KTD instances for Koha feature development.
+
+set -e
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+
+kd — Koha dev workflow wrapper
+
+Usage:
+    kd up <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
+                 [--selenium] [--smtp] [--sso] [--persistent-db]
+    kd down <name> [--rm]
+    kd tmux <name>
+    kd shell <name> [--root] [--run 'cmd']
+    kd logs <name>
+    kd list
+    kd proxy [start|stop|status]
+    kd -h|--help
+
+Commands:
+    up      Create worktree (if needed) and start a KTD instance
+    down    Stop a KTD instance (--rm also removes the worktree)
+    tmux    Attach or create a tmux dev session for the feature
+    shell   Drop into the KTD container shell
+    logs    Follow the KTD container logs
+    list    Show worktrees and their KTD container status
+    proxy   Manage the shared Traefik proxy (start|stop|status)
+
+Environment:
+    KOHA_DIR    Root of the Koha workspace (default: ~/Projects/koha)
+    KTD_HOME    KTD checkout (default: \$KOHA_DIR/tooling/koha-testing-docker)
+
+EOF
+}
+
+setup_env() {
+    export KOHA_DIR="${KOHA_DIR:-$HOME/Projects/koha}"
+    export KTD_HOME="${KTD_HOME:-$KOHA_DIR/tooling/koha-testing-docker}"
+    export LOCAL_USER_ID="$(id -u)"
+    export LOCAL_GROUP_ID="$(id -g)"
+}
+
+# Converts a branch name to a Docker-safe project name and exports KOHA_IMAGE.
+# Versioned branches (NN.NN.TAG, e.g. 24.11.etf) → TAG+MAJOR (etf24), KOHA_IMAGE=24.11
+# All other branches → unchanged, KOHA_IMAGE unset
+resolve_name() {
+    if [[ "$1" =~ ^([0-9]+)\.([0-9]+)\.(.+)$ ]]; then
+        KTD_NAME="${BASH_REMATCH[3]}${BASH_REMATCH[1]}"
+        export KOHA_IMAGE="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+    else
+        KTD_NAME="$1"
+    fi
+}
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+cmd_up() {
+    local name="$1"; shift
+    setup_env
+    resolve_name "$name"
+
+    local worktree="$KOHA_DIR/core/worktrees/$name"
+    local bare="$KOHA_DIR/core/koha.git"
+    local ktd_extra=()
+    local plugin_path=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --plugin)
+                plugin_path="$(realpath "$2")"
+                ktd_extra+=(--single-plugin "$plugin_path")
+                shift 2 ;;
+            --plugins|--selenium|--smtp|--sso|--persistent-db)
+                ktd_extra+=("$1"); shift ;;
+            --search-engine)
+                ktd_extra+=(--search-engine "$2"); shift 2 ;;
+            *) echo "unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [ ! -d "$bare" ]; then
+        echo "error: bare repo not found at $bare" >&2
+        echo "       set KOHA_DIR or check your layout" >&2
+        exit 1
+    fi
+
+    if [ ! -d "$worktree" ]; then
+        if git -C "$bare" show-ref --verify --quiet "refs/heads/$name"; then
+            echo "branch $name exists — checking it out as a worktree"
+            git -C "$bare" worktree add "$worktree" "$name"
+        else
+            echo "creating new branch $name from main"
+            git -C "$bare" worktree add "$worktree" -b "$name" main
+        fi
+    fi
+
+    # Pre-create remember plugin log dir so hooks don't error on first run in a
+    # fresh worktree (the shell opens the redirect before session-start can mkdir).
+    mkdir -p "$worktree/.remember/logs"
+
+    if ! docker ps --format '{{.Names}}' | grep -q '^proxy-proxy-1$'; then
+        echo "starting ktd_proxy..."
+        ktd_proxy --start
+    fi
+
+    export SYNC_REPO="$worktree"
+    export KTD_INSTANCE="$KTD_NAME"
+    cd "$worktree"
+
+    echo "bringing up KTD instance: $KTD_NAME"
+    ktd --proxy --name "$KTD_NAME" "${ktd_extra[@]}" up -d
+
+    cat <<EOF
+
+KTD instance '$KTD_NAME' is up.
+  OPAC:     http://$KTD_NAME.kohadev.home
+  Staff:    http://$KTD_NAME-intra.kohadev.home
+  Worktree: $worktree
+EOF
+    [ -n "$plugin_path" ] && echo "  Plugin:   $plugin_path"
+    true
+}
+
+cmd_down() {
+    local name="$1"; shift
+    setup_env
+    resolve_name "$name"
+
+    local remove_worktree="no"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --rm) remove_worktree="yes"; shift ;;
+            *) echo "unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    local worktree="$KOHA_DIR/core/worktrees/$name"
+
+    echo "bringing down KTD instance: $KTD_NAME"
+    ktd down "$KTD_NAME" || true
+
+    if [ "$remove_worktree" = "yes" ] && [ -d "$worktree" ]; then
+        echo "removing worktree $worktree"
+        git -C "$KOHA_DIR/core/koha.git" worktree remove --force "$worktree" \
+            || rm -rf "$worktree"
+    fi
+
+    echo "done."
+}
+
+cmd_tmux() {
+    local name="$1"
+    setup_env
+    resolve_name "$name"
+
+    local worktree="$KOHA_DIR/core/worktrees/$name"
+    if [ ! -d "$worktree" ]; then
+        echo "worktree $worktree does not exist; run: kd up $name" >&2
+        exit 1
+    fi
+
+    local session="koha-$KTD_NAME"
+    if tmux has-session -t "$session" 2>/dev/null; then
+        exec tmux attach -t "$session"
+    fi
+
+    local tmux_env=(
+        -e "KTD_INSTANCE=$KTD_NAME"
+        -e "SYNC_REPO=$worktree"
+    )
+
+    # Window 1: container visibility — logs left, shell right
+    tmux new-session -d -s "$session" -c "$worktree" -n "container" \
+        "${tmux_env[@]}" "docker logs -f ${KTD_NAME}-koha-1"
+    tmux split-window -h -t "$session:container" -c "$worktree" \
+        "ktd --shell --name $KTD_NAME"
+    tmux select-pane -t "$session:container.1"
+
+    # Window 2: dev — claude left, empty term right
+    tmux new-window -t "$session" -n "dev" -c "$worktree" "claude"
+    tmux split-window -h -t "$session:dev" -c "$worktree"
+    tmux select-pane -t "$session:dev.1"
+
+    tmux select-window -t "$session:dev"
+    exec tmux attach -t "$session"
+}
+
+cmd_shell() {
+    local name="$1"; shift
+    setup_env
+    resolve_name "$name"
+
+    local extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --root)     extra+=(--root); shift ;;
+            --run)      extra+=(--run "$2"); shift 2 ;;
+            *) echo "unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    export SYNC_REPO="$KOHA_DIR/core/worktrees/$name"
+    ktd --shell --name "$KTD_NAME" "${extra[@]}"
+}
+
+cmd_logs() {
+    local name="$1"
+    setup_env
+    resolve_name "$name"
+
+    export SYNC_REPO="$KOHA_DIR/core/worktrees/$name"
+    ktd --logs --name "$KTD_NAME"
+}
+
+cmd_list() {
+    setup_env
+
+    local worktree_dir="$KOHA_DIR/core/worktrees"
+    if [ ! -d "$worktree_dir" ]; then
+        echo "no worktrees found at $worktree_dir" >&2
+        exit 1
+    fi
+
+    printf "%-35s  %-25s  %s\n" "BRANCH" "CONTAINER" "STATUS"
+    printf "%-35s  %-25s  %s\n" \
+        "$(printf '%.0s-' {1..35})" \
+        "$(printf '%.0s-' {1..25})" \
+        "-------"
+
+    for worktree in "$worktree_dir"/*/; do
+        [ -d "$worktree" ] || continue
+        local branch
+        branch="$(basename "$worktree")"
+        resolve_name "$branch"
+
+        local container="${KTD_NAME}-koha-1"
+        local status
+        status="$(docker ps -a --filter "name=^${container}$" --format '{{.Status}}' 2>/dev/null)"
+        [ -z "$status" ] && status="not found"
+
+        printf "%-35s  %-25s  %s\n" "$branch" "$container" "$status"
+    done
+}
+
+cmd_proxy() {
+    setup_env
+    case "${1:-status}" in
+        start)  ktd_proxy --start ;;
+        stop)   ktd_proxy --stop ;;
+        status) ktd_proxy --status ;;
+        *) echo "usage: kd proxy [start|stop|status]" >&2; exit 1 ;;
+    esac
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+
+CMD="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$CMD" in
+    up)    [ -n "$1" ] || { echo "usage: kd up <name> [options]" >&2; exit 1; }
+           cmd_up "$@" ;;
+    down)  [ -n "$1" ] || { echo "usage: kd down <name> [--rm]" >&2; exit 1; }
+           cmd_down "$@" ;;
+    tmux)  [ -n "$1" ] || { echo "usage: kd tmux <name>" >&2; exit 1; }
+           cmd_tmux "$@" ;;
+    shell) [ -n "$1" ] || { echo "usage: kd shell <name> [--root] [--run 'cmd']" >&2; exit 1; }
+           cmd_shell "$@" ;;
+    logs)  [ -n "$1" ] || { echo "usage: kd logs <name>" >&2; exit 1; }
+           cmd_logs "$@" ;;
+    list)  cmd_list ;;
+    proxy) cmd_proxy "$@" ;;
+    -h|--help) usage ;;
+    "") usage; exit 1 ;;
+    *) echo "unknown command: $CMD" >&2; usage; exit 1 ;;
+esac
