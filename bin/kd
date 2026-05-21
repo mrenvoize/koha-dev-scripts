@@ -186,19 +186,20 @@ _format_tracking() {
     if [ -z "$upstream" ]; then
         echo "(local only)"; return
     fi
-    if [ -z "$track" ]; then
-        echo "="; return
-    fi
     if [[ "$track" == *"gone"* ]]; then
-        echo "[gone]"; return
+        echo "$upstream (gone)"; return
     fi
-    local result=""
-    if [[ "$track" =~ ahead\ ([0-9]+) ]];  then result+="^${BASH_REMATCH[1]}"; fi
-    if [[ "$track" =~ behind\ ([0-9]+) ]]; then
-        [ -n "$result" ] && result+=" "
-        result+="v${BASH_REMATCH[1]}"
+    local ahead="" behind="" status=""
+    [[ "$track" =~ ahead\ ([0-9]+) ]]  && ahead="${BASH_REMATCH[1]}"
+    [[ "$track" =~ behind\ ([0-9]+) ]] && behind="${BASH_REMATCH[1]}"
+    if [ -n "$ahead" ] && [ -n "$behind" ]; then
+        status="ahead $ahead, behind $behind"
+    elif [ -n "$ahead" ]; then
+        status="ahead $ahead"
+    elif [ -n "$behind" ]; then
+        status="behind $behind"
     fi
-    echo "${result:-=}"
+    [ -n "$status" ] && echo "$upstream  $status" || echo "$upstream"
 }
 
 cmd_wt() {
