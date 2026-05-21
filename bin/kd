@@ -12,25 +12,29 @@ usage() {
 kd — Koha dev workflow wrapper
 
 Usage:
-    kd up <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
-                 [--selenium] [--smtp] [--sso] [--persistent-db] [--tmux]
+    kd up  <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
+                  [--selenium] [--smtp] [--sso] [--persistent-db] [--bz] [--tmux]
+    kd wt  <name> [--bz]
     kd down <name> [--rm]
     kd tmux <name>
     kd shell <name> [--root] [--run 'cmd']
     kd logs <name>
     kd list
+    kd branches
     kd proxy [start|stop|status]
     kd -h|--help
 
 Commands:
-    up      Create worktree (if needed) and start a KTD instance; --tmux waits for
-            KTD to be ready then opens a tmux dev session automatically
-    down    Stop a KTD instance (--rm also removes the worktree)
-    tmux    Attach or create a tmux dev session for the feature
-    shell   Drop into the KTD container shell
-    logs    Follow the KTD container logs
-    list    Show worktrees and their KTD container status
-    proxy   Manage the shared Traefik proxy (start|stop|status)
+    up        Create worktree (if needed) and start a KTD instance; --bz applies the
+              bug's patches before booting; --tmux waits for KTD then opens tmux
+    wt        Create worktree only (no KTD); --bz applies the bug's patches
+    down      Stop a KTD instance (--rm also removes the worktree)
+    tmux      Attach or create a tmux dev session for the feature
+    shell     Drop into the KTD container shell
+    logs      Follow the KTD container logs
+    list      Show worktrees and their KTD container status
+    branches  Table of local branches, worktrees, containers, and upstream tracking
+    proxy     Manage the shared Traefik proxy (start|stop|status)
 
 Environment:
     KOHA_DIR    Root of the Koha workspace (default: ~/Projects/koha)
@@ -69,6 +73,7 @@ cmd_up() {
     local bare="$KOHA_DIR/core/koha.git"
     local ktd_extra=()
     local plugin_path=""
+    local apply_bz=0
     local open_tmux=0
 
     while [[ $# -gt 0 ]]; do
@@ -81,6 +86,7 @@ cmd_up() {
                 ktd_extra+=("$1"); shift ;;
             --search-engine)
                 ktd_extra+=(--search-engine "$2"); shift 2 ;;
+            --bz)   apply_bz=1; shift ;;
             --tmux) open_tmux=1; shift ;;
             *) echo "unknown option: $1" >&2; exit 1 ;;
         esac
@@ -105,6 +111,17 @@ cmd_up() {
     # Pre-create remember plugin log dir so hooks don't error on first run in a
     # fresh worktree (the shell opens the redirect before session-start can mkdir).
     mkdir -p "$worktree/.remember/logs"
+
+    if [ "$apply_bz" -eq 1 ]; then
+        local bz_num
+        bz_num="$(_bz_from_name "$name")"
+        if [ -z "$bz_num" ]; then
+            echo "error: cannot extract bug number from '$name' (expected bug_NNNNN form)" >&2
+            exit 1
+        fi
+        echo "applying bz $bz_num..."
+        (cd "$worktree" && git bz apply "$bz_num")
+    fi
 
     if ! docker ps --format '{{.Names}}' | grep -q '^proxy-proxy-1$'; then
         echo "starting ktd_proxy..."
@@ -155,6 +172,148 @@ EOF
 
         cmd_tmux "$name"
     fi
+}
+
+# Extracts a Bugzilla number from a branch name of the form bug_NNNNN[-suffix].
+_bz_from_name() {
+    if [[ "$1" =~ bug_([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+_format_tracking() {
+    local upstream="$1" track="$2"
+    if [ -z "$upstream" ]; then
+        echo "(local only)"; return
+    fi
+    if [ -z "$track" ]; then
+        echo "="; return
+    fi
+    if [[ "$track" == *"gone"* ]]; then
+        echo "[gone]"; return
+    fi
+    local result=""
+    if [[ "$track" =~ ahead\ ([0-9]+) ]];  then result+="^${BASH_REMATCH[1]}"; fi
+    if [[ "$track" =~ behind\ ([0-9]+) ]]; then
+        [ -n "$result" ] && result+=" "
+        result+="v${BASH_REMATCH[1]}"
+    fi
+    echo "${result:-=}"
+}
+
+cmd_wt() {
+    local name="$1"; shift
+    setup_env
+
+    local worktree="$KOHA_DIR/core/worktrees/$name"
+    local bare="$KOHA_DIR/core/koha.git"
+    local apply_bz=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --bz) apply_bz=1; shift ;;
+            *) echo "unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [ ! -d "$bare" ]; then
+        echo "error: bare repo not found at $bare" >&2; exit 1
+    fi
+
+    if [ ! -d "$worktree" ]; then
+        if git -C "$bare" show-ref --verify --quiet "refs/heads/$name"; then
+            echo "branch $name exists — checking it out as a worktree"
+            git -C "$bare" worktree add "$worktree" "$name"
+        else
+            echo "creating new branch $name from main"
+            git -C "$bare" worktree add "$worktree" -b "$name" main
+        fi
+    else
+        echo "worktree already exists at $worktree"
+    fi
+
+    mkdir -p "$worktree/.remember/logs"
+
+    if [ "$apply_bz" -eq 1 ]; then
+        local bz_num
+        bz_num="$(_bz_from_name "$name")"
+        if [ -z "$bz_num" ]; then
+            echo "error: cannot extract bug number from '$name' (expected bug_NNNNN form)" >&2
+            exit 1
+        fi
+        echo "applying bz $bz_num..."
+        (cd "$worktree" && git bz apply "$bz_num")
+    fi
+
+    echo ""
+    echo "worktree ready: $worktree"
+    echo "  cd $worktree"
+    [ -n "$bz_num" ] || echo "  kd tmux $name   # to open a dev session"
+}
+
+cmd_branches() {
+    setup_env
+    local bare="$KOHA_DIR/core/koha.git"
+    local worktree_dir="$KOHA_DIR/core/worktrees"
+
+    [ -d "$bare" ] || { echo "error: bare repo not found at $bare" >&2; exit 1; }
+
+    # Build worktree lookup
+    declare -A wt_set
+    if [ -d "$worktree_dir" ]; then
+        for wt in "$worktree_dir"/*/; do
+            [ -d "$wt" ] && wt_set["$(basename "$wt")"]=1
+        done
+    fi
+
+    printf "%-45s  %-40s  %s\n" "BRANCH" "KTD" "TRACKING"
+    printf "%-45s  %-40s  %s\n" \
+        "$(printf '%.0s-' {1..45})" \
+        "$(printf '%.0s-' {1..40})" \
+        "--------"
+
+    declare -A seen_local
+
+    while IFS='|' read -r branch upstream track; do
+        seen_local["$branch"]=1
+
+        local ktd="-"
+        if [ "${wt_set[$branch]+x}" ]; then
+            resolve_name "$branch"
+            local cname="${KTD_NAME}-koha-1"
+            local cstatus
+            cstatus="$(docker ps -a --filter "name=^${cname}$" --format '{{.Status}}' 2>/dev/null)"
+            if [ -n "$cstatus" ]; then
+                ktd="${cname} (${cstatus})"
+            else
+                ktd="(no container)"
+            fi
+        fi
+
+        local tracking
+        tracking="$(_format_tracking "$upstream" "$track")"
+        printf "%-45s  %-40s  %s\n" "$branch" "$ktd" "$tracking"
+    done < <(git -C "$bare" for-each-ref \
+        --sort=refname \
+        --format='%(refname:short)|%(upstream:short)|%(upstream:track)' \
+        refs/heads/)
+
+    # Remote-only branches
+    local remote_header_shown=0
+    while read -r rbranch; do
+        [ "${seen_local[$rbranch]+x}" ] && continue
+        if [ "$remote_header_shown" -eq 0 ]; then
+            echo ""
+            printf "%-45s  %-40s  %s\n" "REMOTE-ONLY BRANCHES" "" ""
+            remote_header_shown=1
+        fi
+        printf "%-45s  %-40s  %s\n" "  origin/$rbranch" "-" "(remote only)"
+    done < <(git -C "$bare" for-each-ref \
+        --sort=refname \
+        --format='%(refname:short)' \
+        refs/remotes/origin/ \
+        | sed 's|^origin/||' \
+        | grep -v '^HEAD$')
 }
 
 cmd_down() {
@@ -294,18 +453,21 @@ CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
 case "$CMD" in
-    up)    [ -n "$1" ] || { echo "usage: kd up <name> [options]" >&2; exit 1; }
-           cmd_up "$@" ;;
-    down)  [ -n "$1" ] || { echo "usage: kd down <name> [--rm]" >&2; exit 1; }
-           cmd_down "$@" ;;
-    tmux)  [ -n "$1" ] || { echo "usage: kd tmux <name>" >&2; exit 1; }
-           cmd_tmux "$@" ;;
-    shell) [ -n "$1" ] || { echo "usage: kd shell <name> [--root] [--run 'cmd']" >&2; exit 1; }
-           cmd_shell "$@" ;;
-    logs)  [ -n "$1" ] || { echo "usage: kd logs <name>" >&2; exit 1; }
-           cmd_logs "$@" ;;
-    list)  cmd_list ;;
-    proxy) cmd_proxy "$@" ;;
+    up)       [ -n "$1" ] || { echo "usage: kd up <name> [options]" >&2; exit 1; }
+              cmd_up "$@" ;;
+    wt)       [ -n "$1" ] || { echo "usage: kd wt <name> [--bz NUM]" >&2; exit 1; }
+              cmd_wt "$@" ;;
+    down)     [ -n "$1" ] || { echo "usage: kd down <name> [--rm]" >&2; exit 1; }
+              cmd_down "$@" ;;
+    tmux)     [ -n "$1" ] || { echo "usage: kd tmux <name>" >&2; exit 1; }
+              cmd_tmux "$@" ;;
+    shell)    [ -n "$1" ] || { echo "usage: kd shell <name> [--root] [--run 'cmd']" >&2; exit 1; }
+              cmd_shell "$@" ;;
+    logs)     [ -n "$1" ] || { echo "usage: kd logs <name>" >&2; exit 1; }
+              cmd_logs "$@" ;;
+    list)     cmd_list ;;
+    branches|br) cmd_branches ;;
+    proxy)    cmd_proxy "$@" ;;
     -h|--help) usage ;;
     "") usage; exit 1 ;;
     *) echo "unknown command: $CMD" >&2; usage; exit 1 ;;
