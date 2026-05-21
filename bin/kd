@@ -13,7 +13,7 @@ kd — Koha dev workflow wrapper
 
 Usage:
     kd up <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
-                 [--selenium] [--smtp] [--sso] [--persistent-db]
+                 [--selenium] [--smtp] [--sso] [--persistent-db] [--tmux]
     kd down <name> [--rm]
     kd tmux <name>
     kd shell <name> [--root] [--run 'cmd']
@@ -23,7 +23,8 @@ Usage:
     kd -h|--help
 
 Commands:
-    up      Create worktree (if needed) and start a KTD instance
+    up      Create worktree (if needed) and start a KTD instance; --tmux waits for
+            KTD to be ready then opens a tmux dev session automatically
     down    Stop a KTD instance (--rm also removes the worktree)
     tmux    Attach or create a tmux dev session for the feature
     shell   Drop into the KTD container shell
@@ -68,6 +69,7 @@ cmd_up() {
     local bare="$KOHA_DIR/core/koha.git"
     local ktd_extra=()
     local plugin_path=""
+    local open_tmux=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -79,6 +81,7 @@ cmd_up() {
                 ktd_extra+=("$1"); shift ;;
             --search-engine)
                 ktd_extra+=(--search-engine "$2"); shift 2 ;;
+            --tmux) open_tmux=1; shift ;;
             *) echo "unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -123,7 +126,35 @@ KTD instance '$KTD_NAME' is up.
   Worktree: $worktree
 EOF
     [ -n "$plugin_path" ] && echo "  Plugin:   $plugin_path"
-    true
+
+    if [ "$open_tmux" -eq 1 ]; then
+        local container="${KTD_NAME}-koha-1"
+        local opac_url="http://${KTD_NAME}.kohadev.home"
+        local timeout=300
+        local elapsed=0
+
+        echo ""
+        printf "waiting for '%s' to be ready" "$KTD_NAME"
+
+        while ! docker ps --filter "name=^${container}$" --filter "status=running" \
+                --format '{{.Names}}' 2>/dev/null | grep -q .; do
+            if [ "$elapsed" -ge "$timeout" ]; then
+                echo ""; echo "timeout: $container did not start" >&2; exit 1
+            fi
+            sleep 3; elapsed=$((elapsed + 3)); printf "."
+        done
+
+        while ! curl -sf --max-time 5 "$opac_url" -o /dev/null 2>/dev/null; do
+            if [ "$elapsed" -ge "$timeout" ]; then
+                echo ""; echo "warning: OPAC not yet responding — starting tmux anyway"
+                cmd_tmux "$name"; return
+            fi
+            sleep 3; elapsed=$((elapsed + 3)); printf "."
+        done
+        echo " ready!"
+
+        cmd_tmux "$name"
+    fi
 }
 
 cmd_down() {
