@@ -147,28 +147,65 @@ EOF
     if [ "$open_tmux" -eq 1 ]; then
         local container="${KTD_NAME}-koha-1"
         local opac_url="http://${KTD_NAME}.kohadev.home"
-        local timeout=300
-        local elapsed=0
 
         echo ""
-        printf "waiting for '%s' to be ready" "$KTD_NAME"
 
+        # Phase 1: wait for the container to enter running state (up to 60s)
+        local p1_timeout=60 p1_elapsed=0
+        printf "waiting for container '%s' to start" "$container"
         while ! docker ps --filter "name=^${container}$" --filter "status=running" \
                 --format '{{.Names}}' 2>/dev/null | grep -q .; do
-            if [ "$elapsed" -ge "$timeout" ]; then
-                echo ""; echo "timeout: $container did not start" >&2; exit 1
+            local cstate
+            cstate=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null)
+            if [[ "$cstate" == "exited" || "$cstate" == "dead" ]]; then
+                local exit_code
+                exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
+                printf "\nerror: container exited (code %s) — run: kd logs %s\n" \
+                    "${exit_code:-?}" "$name" >&2
+                exit 1
             fi
-            sleep 3; elapsed=$((elapsed + 3)); printf "."
+            if [ "$p1_elapsed" -ge "$p1_timeout" ]; then
+                printf "\ntimeout: %s did not start within %ds\n" "$container" "$p1_timeout" >&2
+                exit 1
+            fi
+            sleep 3; p1_elapsed=$((p1_elapsed + 3)); printf "."
         done
+        printf " up (%ds)\n" "$p1_elapsed"
 
+        # Phase 2: wait for the OPAC to respond (up to 300s)
+        # Shows the last container log line every 15s so progress is visible.
+        local p2_timeout=300 p2_elapsed=0 log_every=15
+        printf "waiting for Koha to initialize"
         while ! curl -sf --max-time 5 "$opac_url" -o /dev/null 2>/dev/null; do
-            if [ "$elapsed" -ge "$timeout" ]; then
-                echo ""; echo "warning: OPAC not yet responding — starting tmux anyway"
+            local cstate
+            cstate=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null)
+            if [[ "$cstate" == "exited" || "$cstate" == "dead" ]]; then
+                local exit_code
+                exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
+                printf "\nerror: container exited (code %s) — run: kd logs %s\n" \
+                    "${exit_code:-?}" "$name" >&2
+                exit 1
+            fi
+            if [ "$p2_elapsed" -ge "$p2_timeout" ]; then
+                printf "\nwarning: OPAC not yet responding after %ds — opening tmux anyway\n" \
+                    "$p2_timeout"
                 cmd_tmux "$name"; return
             fi
-            sleep 3; elapsed=$((elapsed + 3)); printf "."
+            sleep 3; p2_elapsed=$((p2_elapsed + 3))
+            if [ $(( p2_elapsed % log_every )) -eq 0 ]; then
+                local last_log
+                last_log=$(docker logs --tail 1 "$container" 2>/dev/null \
+                    | sed 's/\x1b\[[0-9;]*[mGKH]//g' | tr -d '\r' | cut -c1-72)
+                if [ -n "$last_log" ]; then
+                    printf "\n  (%ds) %s" "$p2_elapsed" "$last_log"
+                else
+                    printf " (%ds)" "$p2_elapsed"
+                fi
+            else
+                printf "."
+            fi
         done
-        echo " ready!"
+        printf " ready! (%ds)\n" "$p2_elapsed"
 
         cmd_tmux "$name"
     fi
