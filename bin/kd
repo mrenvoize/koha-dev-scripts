@@ -62,6 +62,17 @@ resolve_name() {
     fi
 }
 
+# Returns the DNS domain used by the Traefik proxy on this machine.
+# On kohadev.home the wildcard DNS resolves *.kohadev.home; everywhere else
+# fall back to *.localhost (which browsers resolve without any DNS).
+_ktd_domain() {
+    if getent hosts "kohadev.home" > /dev/null 2>&1; then
+        echo "kohadev.home"
+    else
+        echo "localhost"
+    fi
+}
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 cmd_up() {
@@ -135,18 +146,20 @@ cmd_up() {
     echo "bringing up KTD instance: $KTD_NAME"
     ktd --proxy --name "$KTD_NAME" "${ktd_extra[@]}" up -d
 
+    local domain
+    domain="$(_ktd_domain)"
+
     cat <<EOF
 
 KTD instance '$KTD_NAME' is up.
-  OPAC:     http://$KTD_NAME.kohadev.home
-  Staff:    http://$KTD_NAME-intra.kohadev.home
+  OPAC:     http://$KTD_NAME.$domain
+  Staff:    http://$KTD_NAME-intra.$domain
   Worktree: $worktree
 EOF
     [ -n "$plugin_path" ] && echo "  Plugin:   $plugin_path"
 
     if [ "$open_tmux" -eq 1 ]; then
         local container="${KTD_NAME}-koha-1"
-        local opac_url="http://${KTD_NAME}.kohadev.home"
 
         echo ""
 
@@ -172,14 +185,31 @@ EOF
         done
         printf " up (%ds)\n" "$p1_elapsed"
 
-        # Phase 2: wait for the OPAC to respond (up to 300s)
-        # Shows the last container log line every 15s so progress is visible.
+        # Phase 2: wait for the KTD ready banner in the container log (up to 300s).
+        # Follows the log in a background subshell; creates a flag file when the
+        # marker line appears so the poll loop can detect it without a curl hit.
+        local ready_marker="koha-testing-docker has started up and is ready to be enjoyed!"
         local p2_timeout=300 p2_elapsed=0 log_every=15
+        local ready_flag
+        ready_flag="$(mktemp)"
+        rm -f "$ready_flag"
+
+        ( docker logs --follow "$container" 2>&1 | \
+              grep -m1 "$ready_marker" > /dev/null 2>&1 && \
+              touch "$ready_flag" ) &
+        local log_follow_pid=$!
+
         printf "waiting for Koha to initialize"
-        while ! curl -sf --max-time 5 "$opac_url" -o /dev/null 2>/dev/null; do
+        while true; do
+            if [ -f "$ready_flag" ]; then
+                kill "$log_follow_pid" 2>/dev/null || true
+                wait "$log_follow_pid" 2>/dev/null || true
+                break
+            fi
             local cstate
             cstate=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null)
             if [[ "$cstate" == "exited" || "$cstate" == "dead" ]]; then
+                kill "$log_follow_pid" 2>/dev/null || true
                 local exit_code
                 exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
                 printf "\nerror: container exited (code %s) — run: kd logs %s\n" \
@@ -187,7 +217,8 @@ EOF
                 exit 1
             fi
             if [ "$p2_elapsed" -ge "$p2_timeout" ]; then
-                printf "\nwarning: OPAC not yet responding after %ds — opening tmux anyway\n" \
+                kill "$log_follow_pid" 2>/dev/null || true
+                printf "\nwarning: Koha not ready after %ds — opening tmux anyway\n" \
                     "$p2_timeout"
                 cmd_tmux "$name"; return
             fi
