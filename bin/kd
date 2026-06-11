@@ -176,31 +176,29 @@ cmd_up() {
     printf " up (%ds)\n\n" "$p1_elapsed"
 
     # Phase 2: stream container logs until the ready marker appears or the
-    # container exits.  touch(1) on the flag file from inside the pipe subshell
-    # is visible to the outer process via the real filesystem.
-    local ready_flag
-    ready_flag="$(mktemp)"
-    rm -f "$ready_flag"
+    # container exits.  Process substitution (not a pipe) keeps the while loop
+    # in the current shell so break returns control immediately rather than
+    # waiting for docker logs --follow to exit on its own.
+    local ready=0
 
     echo "--- KTD startup logs -----------------------------------------------"
-    docker logs --follow "$container" 2>&1 | while IFS= read -r line; do
+    while IFS= read -r line; do
         printf '%s\n' "$line"
         if [[ "$line" == *"$ready_marker"* ]]; then
-            touch "$ready_flag"
+            ready=1
             break
         fi
-    done
+    done < <(docker logs --follow "$container" 2>&1)
     echo "--------------------------------------------------------------------"
     echo ""
 
-    if [ ! -f "$ready_flag" ]; then
+    if [ "$ready" -eq 0 ]; then
         local exit_code
         exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
         printf "error: container exited (code %s) — run: kd logs %s\n" \
             "${exit_code:-?}" "$name" >&2
         exit 1
     fi
-    rm -f "$ready_flag"
 
     cat <<EOF
 KTD instance '$KTD_NAME' is up.
