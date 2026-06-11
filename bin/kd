@@ -146,11 +146,63 @@ cmd_up() {
     echo "bringing up KTD instance: $KTD_NAME"
     ktd --proxy --name "$KTD_NAME" "${ktd_extra[@]}" up -d
 
-    local domain
+    local domain container ready_marker
     domain="$(_ktd_domain)"
+    container="${KTD_NAME}-koha-1"
+    ready_marker="koha-testing-docker has started up and is ready to be enjoyed!"
+
+    echo ""
+
+    # Phase 1: wait for the container to enter running state (up to 60s)
+    local p1_timeout=60 p1_elapsed=0
+    printf "waiting for container '%s' to start" "$container"
+    while ! docker ps --filter "name=^${container}$" --filter "status=running" \
+            --format '{{.Names}}' 2>/dev/null | grep -q .; do
+        local cstate
+        cstate=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null)
+        if [[ "$cstate" == "exited" || "$cstate" == "dead" ]]; then
+            local exit_code
+            exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
+            printf "\nerror: container exited (code %s) — run: kd logs %s\n" \
+                "${exit_code:-?}" "$name" >&2
+            exit 1
+        fi
+        if [ "$p1_elapsed" -ge "$p1_timeout" ]; then
+            printf "\ntimeout: %s did not start within %ds\n" "$container" "$p1_timeout" >&2
+            exit 1
+        fi
+        sleep 3; p1_elapsed=$((p1_elapsed + 3)); printf "."
+    done
+    printf " up (%ds)\n\n" "$p1_elapsed"
+
+    # Phase 2: stream container logs until the ready marker appears or the
+    # container exits.  touch(1) on the flag file from inside the pipe subshell
+    # is visible to the outer process via the real filesystem.
+    local ready_flag
+    ready_flag="$(mktemp)"
+    rm -f "$ready_flag"
+
+    echo "--- KTD startup logs -----------------------------------------------"
+    docker logs --follow "$container" 2>&1 | while IFS= read -r line; do
+        printf '%s\n' "$line"
+        if [[ "$line" == *"$ready_marker"* ]]; then
+            touch "$ready_flag"
+            break
+        fi
+    done
+    echo "--------------------------------------------------------------------"
+    echo ""
+
+    if [ ! -f "$ready_flag" ]; then
+        local exit_code
+        exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
+        printf "error: container exited (code %s) — run: kd logs %s\n" \
+            "${exit_code:-?}" "$name" >&2
+        exit 1
+    fi
+    rm -f "$ready_flag"
 
     cat <<EOF
-
 KTD instance '$KTD_NAME' is up.
   OPAC:     http://$KTD_NAME.$domain
   Staff:    http://$KTD_NAME-intra.$domain
@@ -159,85 +211,6 @@ EOF
     [ -n "$plugin_path" ] && echo "  Plugin:   $plugin_path"
 
     if [ "$open_tmux" -eq 1 ]; then
-        local container="${KTD_NAME}-koha-1"
-
-        echo ""
-
-        # Phase 1: wait for the container to enter running state (up to 60s)
-        local p1_timeout=60 p1_elapsed=0
-        printf "waiting for container '%s' to start" "$container"
-        while ! docker ps --filter "name=^${container}$" --filter "status=running" \
-                --format '{{.Names}}' 2>/dev/null | grep -q .; do
-            local cstate
-            cstate=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null)
-            if [[ "$cstate" == "exited" || "$cstate" == "dead" ]]; then
-                local exit_code
-                exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
-                printf "\nerror: container exited (code %s) — run: kd logs %s\n" \
-                    "${exit_code:-?}" "$name" >&2
-                exit 1
-            fi
-            if [ "$p1_elapsed" -ge "$p1_timeout" ]; then
-                printf "\ntimeout: %s did not start within %ds\n" "$container" "$p1_timeout" >&2
-                exit 1
-            fi
-            sleep 3; p1_elapsed=$((p1_elapsed + 3)); printf "."
-        done
-        printf " up (%ds)\n" "$p1_elapsed"
-
-        # Phase 2: wait for the KTD ready banner in the container log (up to 300s).
-        # Follows the log in a background subshell; creates a flag file when the
-        # marker line appears so the poll loop can detect it without a curl hit.
-        local ready_marker="koha-testing-docker has started up and is ready to be enjoyed!"
-        local p2_timeout=300 p2_elapsed=0 log_every=15
-        local ready_flag
-        ready_flag="$(mktemp)"
-        rm -f "$ready_flag"
-
-        ( docker logs --follow "$container" 2>&1 | \
-              grep -m1 "$ready_marker" > /dev/null 2>&1 && \
-              touch "$ready_flag" ) &
-        local log_follow_pid=$!
-
-        printf "waiting for Koha to initialize"
-        while true; do
-            if [ -f "$ready_flag" ]; then
-                kill "$log_follow_pid" 2>/dev/null || true
-                wait "$log_follow_pid" 2>/dev/null || true
-                break
-            fi
-            local cstate
-            cstate=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null)
-            if [[ "$cstate" == "exited" || "$cstate" == "dead" ]]; then
-                kill "$log_follow_pid" 2>/dev/null || true
-                local exit_code
-                exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null)
-                printf "\nerror: container exited (code %s) — run: kd logs %s\n" \
-                    "${exit_code:-?}" "$name" >&2
-                exit 1
-            fi
-            if [ "$p2_elapsed" -ge "$p2_timeout" ]; then
-                kill "$log_follow_pid" 2>/dev/null || true
-                printf "\nwarning: Koha not ready after %ds — opening tmux anyway\n" \
-                    "$p2_timeout"
-                cmd_tmux "$name"; return
-            fi
-            sleep 3; p2_elapsed=$((p2_elapsed + 3))
-            if [ $(( p2_elapsed % log_every )) -eq 0 ]; then
-                local last_log
-                last_log=$(docker logs --tail 1 "$container" 2>/dev/null \
-                    | sed 's/\x1b\[[0-9;]*[mGKH]//g' | tr -d '\r' | cut -c1-72)
-                if [ -n "$last_log" ]; then
-                    printf "\n  (%ds) %s" "$p2_elapsed" "$last_log"
-                else
-                    printf " (%ds)" "$p2_elapsed"
-                fi
-            else
-                printf "."
-            fi
-        done
-        printf " ready! (%ds)\n" "$p2_elapsed"
-
         cmd_tmux "$name"
     fi
 }
