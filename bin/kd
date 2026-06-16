@@ -59,6 +59,7 @@ resolve_name() {
         export KOHA_IMAGE="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
     else
         KTD_NAME="$1"
+        unset KOHA_IMAGE
     fi
 }
 
