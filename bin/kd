@@ -13,8 +13,8 @@ kd — Koha dev workflow wrapper
 
 Usage:
     kd up  <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
-                  [--selenium] [--smtp] [--sso] [--persistent-db] [--bz] [--tmux]
-    kd wt  <name> [--bz]
+                  [--selenium] [--smtp] [--sso] [--persistent-db] [--bz] [--tmux] [--track UPSTREAM]
+    kd wt  <name> [--bz] [--track UPSTREAM]
     kd down <name> [--rm]
     kd tmux <name>
     kd shell <name> [--root] [--run 'cmd']
@@ -26,8 +26,10 @@ Usage:
 
 Commands:
     up        Create worktree (if needed) and start a KTD instance; --bz applies the
-              bug's patches before booting; --tmux waits for KTD then opens tmux
-    wt        Create worktree only (no KTD); --bz applies the bug's patches
+              bug's patches before booting; --tmux waits for KTD then opens tmux;
+              --track UPSTREAM creates branch tracking an upstream ref (e.g. origin/master)
+    wt        Create worktree only (no KTD); --bz applies the bug's patches;
+              --track UPSTREAM creates branch tracking an upstream ref (e.g. origin/master)
     down      Stop a KTD instance (--rm also removes the worktree)
     tmux      Attach or create a tmux dev session for the feature
     shell     Drop into the KTD container shell
@@ -87,6 +89,7 @@ cmd_up() {
     local plugin_path=""
     local apply_bz=0
     local open_tmux=0
+    local track_upstream=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -100,6 +103,8 @@ cmd_up() {
                 ktd_extra+=(--search-engine "$2"); shift 2 ;;
             --bz)   apply_bz=1; shift ;;
             --tmux) open_tmux=1; shift ;;
+            --track)
+                track_upstream="$2"; shift 2 ;;
             *) echo "unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -115,8 +120,14 @@ cmd_up() {
             echo "branch $name exists — checking it out as a worktree"
             git -C "$bare" worktree add "$worktree" "$name"
         else
-            echo "creating new branch $name from main"
-            git -C "$bare" worktree add "$worktree" -b "$name" main
+            if [ -n "$track_upstream" ]; then
+                echo "creating new branch $name tracking $track_upstream"
+                git -C "$bare" worktree add "$worktree" -b "$name" "$track_upstream"
+                git -C "$worktree" branch --set-upstream-to="$track_upstream" "$name"
+            else
+                echo "creating new branch $name from main"
+                git -C "$bare" worktree add "$worktree" -b "$name" main
+            fi
         fi
     fi
 
@@ -249,10 +260,13 @@ cmd_wt() {
     local worktree="$KOHA_DIR/core/worktrees/$name"
     local bare="$KOHA_DIR/core/koha.git"
     local apply_bz=0
+    local track_upstream=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --bz) apply_bz=1; shift ;;
+            --track)
+                track_upstream="$2"; shift 2 ;;
             *) echo "unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -266,8 +280,14 @@ cmd_wt() {
             echo "branch $name exists — checking it out as a worktree"
             git -C "$bare" worktree add "$worktree" "$name"
         else
-            echo "creating new branch $name from main"
-            git -C "$bare" worktree add "$worktree" -b "$name" main
+            if [ -n "$track_upstream" ]; then
+                echo "creating new branch $name tracking $track_upstream"
+                git -C "$bare" worktree add "$worktree" -b "$name" "$track_upstream"
+                git -C "$worktree" branch --set-upstream-to="$track_upstream" "$name"
+            else
+                echo "creating new branch $name from main"
+                git -C "$bare" worktree add "$worktree" -b "$name" main
+            fi
         fi
     else
         echo "worktree already exists at $worktree"
