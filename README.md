@@ -27,6 +27,23 @@ kd proxy [start|stop|status]
 
 Versioned branch names (`NN.NN.TAG`, e.g. `24.11.etf`) are automatically mapped to a Docker-safe project name (`etf24`) and the correct `KOHA_IMAGE`.
 
+## Workspace docs (`workspace/`)
+
+`workspace/` mirrors the shared, machine-agnostic Koha workspace config — the
+`CLAUDE.md` files and `core/docs/*.md` — under the same layout they occupy at
+`$KOHA_DIR`. `install.sh` symlinks each one into place, so the repo is the single
+source of truth: edit here, commit, push, and `git pull && ./install.sh` on the
+other machine picks it up. (Machine-specific `core/notes/` is deliberately not
+synced.)
+
+```
+workspace/
+├── CLAUDE.md            → $KOHA_DIR/CLAUDE.md
+└── core/
+    ├── CLAUDE.md        → $KOHA_DIR/core/CLAUDE.md
+    └── docs/*.md        → $KOHA_DIR/core/docs/*.md
+```
+
 ## Install
 
 ```bash
@@ -34,13 +51,23 @@ git clone <repo-url> ~/Projects/koha/tooling/koha-dev-scripts
 ~/Projects/koha/tooling/koha-dev-scripts/install.sh
 ```
 
-Re-run `install.sh` after pulling — it symlinks everything in `bin/` into `~/.local/bin/` and removes any legacy `koha-feature-*` symlinks.
+`install.sh` is re-runnable and idempotent. It symlinks everything in `bin/` into
+`~/.local/bin/` and everything in `workspace/` into `$KOHA_DIR`, and removes any
+legacy `koha-feature-*` symlinks.
+
+Symlinks already pointing at the repo are left alone. A **real file** found at a
+target is handled safely:
+
+- **identical content** → adopted (replaced with the symlink; nothing is lost);
+- **differing content** → a diff is printed and the file is **left in place**.
+  Re-run with `--force` to replace it — the original is backed up to `<path>.bak`
+  first. Without `--force`, the run exits non-zero and changes nothing else.
 
 ## Sync between machines
 
 ```bash
 git pull
-./install.sh
+./install.sh            # or: ./install.sh --force  to overwrite divergent local files
 ```
 
 ## Dependencies
