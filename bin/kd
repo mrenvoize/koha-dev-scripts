@@ -76,6 +76,31 @@ _ktd_domain() {
     fi
 }
 
+# Claude Code keys its per-project state (history, persistent memory) by the
+# worktree's absolute path with / . _ collapsed to -. Point each worktree's
+# memory dir at the shared root store so accumulated Koha knowledge (MEMORY.md
+# et al.) follows every worktree session. Bug-specific continuation state stays
+# separate in the worktree's own .remember/.
+link_shared_memory() {
+    local worktree="$1"
+    local projects="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+
+    local root_slug worktree_slug
+    root_slug="$(printf '%s' "$KOHA_DIR"    | sed 's/[/._]/-/g')"
+    worktree_slug="$(printf '%s' "$worktree" | sed 's/[/._]/-/g')"
+
+    local shared="$projects/$root_slug/memory"
+    local target="$projects/$worktree_slug/memory"
+
+    [ -d "$shared" ] || return 0   # root store not created yet — nothing to share
+    [ -L "$target" ] && return 0   # already linked
+    [ -e "$target" ] && return 0   # real memory dir exists — don't clobber it
+
+    mkdir -p "$projects/$worktree_slug"
+    ln -s "$shared" "$target"
+    echo "linked shared Claude memory → $target"
+}
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 cmd_up() {
@@ -134,6 +159,7 @@ cmd_up() {
     # Pre-create remember plugin log dir so hooks don't error on first run in a
     # fresh worktree (the shell opens the redirect before session-start can mkdir).
     mkdir -p "$worktree/.remember/logs"
+    link_shared_memory "$worktree"
 
     if [ "$apply_bz" -eq 1 ]; then
         local bz_num
@@ -294,6 +320,7 @@ cmd_wt() {
     fi
 
     mkdir -p "$worktree/.remember/logs"
+    link_shared_memory "$worktree"
 
     if [ "$apply_bz" -eq 1 ]; then
         local bz_num
