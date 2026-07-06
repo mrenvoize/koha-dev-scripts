@@ -33,8 +33,8 @@ npx cypress run --spec "t/cypress/integration/path/to/spec.ts"
 
 ## Reference
 
-@docs/testing.md         — full test commands, `.only`/`.skip`, code quality checks
-@docs/building.md        — yarn build, CSS/JS compilation, Swagger/OpenAPI rebuild
-@docs/architecture.md    — C4 vs Koha/, DBIx::Class, REST API, Vue, plugins
-@docs/database.md        — schema updates, atomicupdate files, DBIC regeneration, system prefs
-@docs/dev-workflow.md    — `kd` wrapper, direct KTD commands, submission process
+@docs/testing.md — full test commands, `.only`/`.skip`, code quality checks
+@docs/building.md — yarn build, CSS/JS compilation, Swagger/OpenAPI rebuild
+@docs/architecture.md — C4 vs Koha/, DBIx::Class, REST API, Vue, plugins
+@docs/database.md — schema updates, atomicupdate files, DBIC regeneration, system prefs
+@docs/dev-workflow.md — `kd` wrapper, direct KTD commands, submission process

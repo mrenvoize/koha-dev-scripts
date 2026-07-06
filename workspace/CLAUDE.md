@@ -22,6 +22,10 @@ The `kd` wrapper (`~/.local/bin/kd`) works on this machine and on `kohadev.home`
 kd up   <feature> [--bz] [--tmux]   # create worktree from main + boot a KTD instance
 kd tmux <feature>                   # attach the dev tmux session (claude + shell + docker logs)
 kd down <feature> [--rm]            # tear down the KTD instance (--rm also removes the worktree)
+kd list                             # show all worktrees with KTD container name and status
+kd shell <feature>                  # drop into the KTD container shell
+kd logs <feature>                   # follow the KTD container logs
+kd proxy [start|stop|status]        # manage the shared Traefik proxy
 ```
 
 Start per-bug Claude Code sessions from `kd tmux`'s "dev" window — it launches
