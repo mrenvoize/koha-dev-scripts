@@ -76,6 +76,19 @@ _ktd_domain() {
     fi
 }
 
+# KTD enables extensions.worktreeConfig (to give worktrees a private core.hooksPath)
+# but never pairs that with a per-worktree core.bare override. Once that extension
+# is on, EVERY linked worktree inherits core.bare=true from the shared bare-repo
+# config instead of being treated as a normal work tree, and any command needing
+# a work tree (git status, git am, git commit...) fails with "fatal: this
+# operation must be run in a work tree" — regardless of cwd. Set the override
+# ourselves so worktrees stay usable even if KTD's own config dance runs first.
+fix_worktree_bare() {
+    local worktree="$1"
+    git -C "$worktree" config extensions.worktreeConfig true
+    git -C "$worktree" config --worktree core.bare false
+}
+
 # Claude Code keys its per-project state (history, persistent memory) by the
 # worktree's absolute path with / . _ collapsed to -. Point each worktree's
 # memory dir at the shared root store so accumulated Koha knowledge (MEMORY.md
@@ -160,6 +173,7 @@ cmd_up() {
     # fresh worktree (the shell opens the redirect before session-start can mkdir).
     mkdir -p "$worktree/.remember/logs"
     link_shared_memory "$worktree"
+    fix_worktree_bare "$worktree"
 
     if [ "$apply_bz" -eq 1 ]; then
         local bz_num
@@ -321,6 +335,7 @@ cmd_wt() {
 
     mkdir -p "$worktree/.remember/logs"
     link_shared_memory "$worktree"
+    fix_worktree_bare "$worktree"
 
     if [ "$apply_bz" -eq 1 ]; then
         local bz_num
