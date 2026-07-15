@@ -15,7 +15,7 @@ Usage:
     kd up  <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
                   [--selenium] [--smtp] [--sso] [--persistent-db] [--bz] [--tmux] [--track UPSTREAM]
     kd wt  <name> [--bz] [--track UPSTREAM]
-    kd down <name> [--rm]
+    kd down <name> [--rm[=full]]
     kd tmux <name>
     kd shell <name> [--root] [--run 'cmd']
     kd logs <name>
@@ -30,7 +30,8 @@ Commands:
               --track UPSTREAM creates branch tracking an upstream ref (e.g. origin/master)
     wt        Create worktree only (no KTD); --bz applies the bug's patches;
               --track UPSTREAM creates branch tracking an upstream ref (e.g. origin/master)
-    down      Stop a KTD instance (--rm also removes the worktree)
+    down      Stop a KTD instance (--rm also removes the worktree;
+              --rm=full also deletes the branch)
     tmux      Attach or create a tmux dev session for the feature
     shell     Drop into the KTD container shell
     logs      Follow the KTD container logs
@@ -425,22 +426,30 @@ cmd_down() {
     resolve_name "$name"
 
     local remove_worktree="no"
+    local remove_branch="no"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --rm) remove_worktree="yes"; shift ;;
+            --rm)      remove_worktree="yes"; shift ;;
+            --rm=full) remove_worktree="yes"; remove_branch="yes"; shift ;;
             *) echo "unknown option: $1" >&2; exit 1 ;;
         esac
     done
 
     local worktree="$KOHA_DIR/core/worktrees/$name"
+    local bare="$KOHA_DIR/core/koha.git"
 
     echo "bringing down KTD instance: $KTD_NAME"
     ktd down "$KTD_NAME" || true
 
     if [ "$remove_worktree" = "yes" ] && [ -d "$worktree" ]; then
         echo "removing worktree $worktree"
-        git -C "$KOHA_DIR/core/koha.git" worktree remove --force "$worktree" \
+        git -C "$bare" worktree remove --force "$worktree" \
             || rm -rf "$worktree"
+    fi
+
+    if [ "$remove_branch" = "yes" ]; then
+        echo "deleting branch $name"
+        git -C "$bare" branch -D "$name" 2>/dev/null || true
     fi
 
     echo "done."
