@@ -306,13 +306,17 @@ _bz_fetch_batch() {
         && mv "$cache.tmp" "$cache"
 }
 
-# Prints "status\ttitle" for a bug number from the cache, or two empty fields.
-_bz_cache_get() {
-    local bug="$1" cache
+# Prints "id\tstatus\ttitle" for each bug number read on stdin (one per
+# line), in a single jq invocation — callers should batch, not loop.
+_bz_cache_get_many() {
+    local cache
     cache="$(_bz_cache_path)"
-    [ -f "$cache" ] || { printf '\t'; return; }
-    jq -r --arg id "$bug" '.[$id] | [.status // "", .summary // ""] | @tsv' "$cache" 2>/dev/null \
-        || printf '\t'
+    [ -s "$cache" ] || return 0
+    jq -R -s -r --slurpfile c "$cache" '
+        ($c[0]) as $cache
+        | split("\n") | map(select(length>0))
+        | map([., ($cache[.].status // ""), ($cache[.].summary // "")] | @tsv)
+        | .[]'
 }
 
 _format_tracking() {
@@ -523,13 +527,24 @@ cmd_list() {
         done
     fi
 
-    # Collect local branches up front so we know which Bugzilla bugs to fetch.
+    # Single docker call for every container's status, instead of one
+    # 'docker ps' per worktree — this dominated runtime on repos with lots
+    # of worktrees.
+    declare -A docker_status
+    while IFS='|' read -r cname cstatus; do
+        [ -n "$cname" ] && docker_status["$cname"]="$cstatus"
+    done < <(docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null)
+
+    # Collect local branches up front (with committer date baked into the
+    # for-each-ref call, avoiding a 'git log' per branch) so we know which
+    # Bugzilla bugs to fetch.
     local branches=()
-    while IFS='|' read -r branch upstream track; do
-        branches+=("$branch|$upstream|$track")
+    while IFS='|' read -r branch upstream track last_worked; do
+        [ -n "$last_worked" ] || last_worked="-"
+        branches+=("$branch|$upstream|$track|$last_worked")
     done < <(git -C "$bare" for-each-ref \
         --sort=refname \
-        --format='%(refname:short)|%(upstream:short)|%(upstream:track)' \
+        --format='%(refname:short)|%(upstream:short)|%(upstream:track)|%(committerdate:relative)' \
         refs/heads/)
 
     local bug_ids=() bug
@@ -557,37 +572,43 @@ cmd_list() {
         fi
     fi
 
+    # One batched cache read for every bug id, instead of one jq call per
+    # bug_/qa_ branch — this was the single biggest cost on repos with a
+    # lot of in-flight bug branches.
+    declare -A bz_status_map bz_title_map
+    if [ "${#bug_ids[@]}" -gt 0 ]; then
+        while IFS=$'\t' read -r id status title; do
+            bz_status_map["$id"]="$status"
+            bz_title_map["$id"]="$title"
+        done < <(printf '%s\n' "${bug_ids[@]}" | _bz_cache_get_many)
+    fi
+
     {
         printf 'BRANCH\tCONTAINER\tTRACKING\tLAST WORKED\tBZ\tTITLE\n'
 
         declare -A seen_local
         for entry in "${branches[@]}"; do
-            IFS='|' read -r branch upstream track <<<"$entry"
+            IFS='|' read -r branch upstream track last_worked <<<"$entry"
             seen_local["$branch"]=1
 
             local ktd="-"
             if [ "${wt_set[$branch]+x}" ]; then
                 resolve_name "$branch"
                 local cname="${KTD_NAME}-koha-1"
-                local cstatus
-                cstatus="$(docker ps -a --filter "name=^${cname}$" --format '{{.Status}}' 2>/dev/null)"
-                if [ -n "$cstatus" ]; then
-                    ktd="${cname} (${cstatus})"
+                if [ "${docker_status[$cname]+x}" ]; then
+                    ktd="${cname} (${docker_status[$cname]})"
                 else
                     ktd="(no container)"
                 fi
             fi
 
-            local tracking last_worked bz_status bz_title
+            local tracking bz_status bz_title
             tracking="$(_format_tracking "$upstream" "$track")"
-            last_worked="$(git -C "$bare" log -1 --format=%cr "$branch" 2>/dev/null)"
-            [ -z "$last_worked" ] && last_worked="-"
 
             bug="$(_bz_from_name "$branch")"
             if [ -n "$bug" ]; then
-                IFS=$'\t' read -r bz_status bz_title <<<"$(_bz_cache_get "$bug")"
-                [ -z "$bz_status" ] && bz_status="?"
-                [ -z "$bz_title" ] && bz_title="?"
+                bz_status="${bz_status_map[$bug]:-?}"
+                bz_title="${bz_title_map[$bug]:-?}"
             else
                 bz_status="-"
                 bz_title="-"
