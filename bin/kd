@@ -34,8 +34,8 @@ Commands:
     tmux      Attach or create a tmux dev session for the feature
     shell     Drop into the KTD container shell
     logs      Follow the KTD container logs
-    list      Table of local branches, worktrees, containers, tracking, last-worked
-              date, and (for bug_/qa_ branches) cached Bugzilla status/title;
+    list      Table of local branches with their Bugzilla title/status,
+              last-worked date, and worktree/container status;
               --refresh forces a fresh Bugzilla lookup. Paged with $PAGER.
     proxy     Manage the shared Traefik proxy (start|stop|status)
 
@@ -319,27 +319,6 @@ _bz_cache_get_many() {
         | .[]'
 }
 
-_format_tracking() {
-    local upstream="$1" track="$2"
-    if [ -z "$upstream" ]; then
-        echo "(local only)"; return
-    fi
-    if [[ "$track" == *"gone"* ]]; then
-        echo "$upstream (gone)"; return
-    fi
-    local ahead="" behind="" status=""
-    [[ "$track" =~ ahead\ ([0-9]+) ]]  && ahead="${BASH_REMATCH[1]}"
-    [[ "$track" =~ behind\ ([0-9]+) ]] && behind="${BASH_REMATCH[1]}"
-    if [ -n "$ahead" ] && [ -n "$behind" ]; then
-        status="ahead $ahead, behind $behind"
-    elif [ -n "$ahead" ]; then
-        status="ahead $ahead"
-    elif [ -n "$behind" ]; then
-        status="behind $behind"
-    fi
-    [ -n "$status" ] && echo "$upstream  $status" || echo "$upstream"
-}
-
 cmd_wt() {
     local name="$1"; shift
     setup_env
@@ -507,6 +486,7 @@ cmd_list() {
     local bare="$KOHA_DIR/core/koha.git"
     local worktree_dir="$KOHA_DIR/core/worktrees"
     local refresh=0
+    local TITLE_WIDTH=60
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -539,12 +519,12 @@ cmd_list() {
     # for-each-ref call, avoiding a 'git log' per branch) so we know which
     # Bugzilla bugs to fetch.
     local branches=()
-    while IFS='|' read -r branch upstream track last_worked; do
+    while IFS='|' read -r branch last_worked; do
         [ -n "$last_worked" ] || last_worked="-"
-        branches+=("$branch|$upstream|$track|$last_worked")
+        branches+=("$branch|$last_worked")
     done < <(git -C "$bare" for-each-ref \
         --sort=refname \
-        --format='%(refname:short)|%(upstream:short)|%(upstream:track)|%(committerdate:relative)' \
+        --format='%(refname:short)|%(committerdate:relative)' \
         refs/heads/)
 
     local bug_ids=() bug
@@ -584,11 +564,11 @@ cmd_list() {
     fi
 
     {
-        printf 'BRANCH\tCONTAINER\tTRACKING\tLAST WORKED\tBZ\tTITLE\n'
+        printf 'BRANCH\tTITLE\tBZ\tLAST WORKED\tCONTAINER\n'
 
         declare -A seen_local
         for entry in "${branches[@]}"; do
-            IFS='|' read -r branch upstream track last_worked <<<"$entry"
+            IFS='|' read -r branch last_worked <<<"$entry"
             seen_local["$branch"]=1
 
             local ktd="-"
@@ -602,20 +582,19 @@ cmd_list() {
                 fi
             fi
 
-            local tracking bz_status bz_title
-            tracking="$(_format_tracking "$upstream" "$track")"
-
+            local bz_status bz_title
             bug="$(_bz_from_name "$branch")"
             if [ -n "$bug" ]; then
                 bz_status="${bz_status_map[$bug]:-?}"
                 bz_title="${bz_title_map[$bug]:-?}"
+                [ "${#bz_title}" -gt "$TITLE_WIDTH" ] && bz_title="${bz_title:0:$((TITLE_WIDTH - 1))}…"
             else
                 bz_status="-"
                 bz_title="-"
             fi
 
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                "$branch" "$ktd" "$tracking" "$last_worked" "$bz_status" "$bz_title"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$branch" "$bz_title" "$bz_status" "$last_worked" "$ktd"
         done
 
         # Remote-only branches
@@ -624,10 +603,10 @@ cmd_list() {
             [ "${seen_local[$rbranch]+x}" ] && continue
             if [ "$remote_header_shown" -eq 0 ]; then
                 printf '\n'
-                printf 'REMOTE-ONLY BRANCHES\t\t\t\t\t\n'
+                printf 'REMOTE-ONLY BRANCHES\t\t\t\t\n'
                 remote_header_shown=1
             fi
-            printf '  origin/%s\t-\t(remote only)\t\t\t\n' "$rbranch"
+            printf '  origin/%s\t-\t-\t-\t(remote only)\n' "$rbranch"
         done < <(git -C "$bare" for-each-ref \
             --sort=refname \
             --format='%(refname:short)' \
