@@ -4,6 +4,13 @@
 
 set -e
 
+# Absolute path to this script, used by 'kd list' to re-invoke itself for
+# fzf's reload bindings regardless of how it was originally launched
+# (PATH lookup, symlink, relative path, ...).
+KD_SELF="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+readonly KD_SELF
+readonly KD_TITLE_WIDTH=60
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 usage() {
@@ -35,8 +42,10 @@ Commands:
     shell     Drop into the KTD container shell
     logs      Follow the KTD container logs
     list      Table of local branches with their Bugzilla title/status,
-              last-worked date, and worktree/container status;
-              --refresh forces a fresh Bugzilla lookup. Paged with $PAGER.
+              last-worked date, and worktree/container status; --refresh
+              forces a fresh Bugzilla lookup. Opens in fzf when available
+              (alt-t/b/l/c sort by title/bz/last-worked/container, alt-r
+              resets to branch order); otherwise falls back to $PAGER.
     proxy     Manage the shared Traefik proxy (start|stop|status)
 
 Environment:
@@ -481,12 +490,78 @@ cmd_logs() {
     ktd --logs --name "$KTD_NAME"
 }
 
+# Sorts and renders the 'kd list' data file built by cmd_list. Called both
+# for the initial fzf view and, via KD_SELF, from fzf's reload bindings —
+# it never re-hits docker/git/Bugzilla, just re-sorts and recolors data
+# that's already on disk, so reloads stay instant.
+cmd_list_render() {
+    local file="$1" sort_key="${2:-branch}"
+    [ -f "$file" ] || { echo "error: kd list data file not found: $file" >&2; exit 1; }
+
+    local col flags
+    case "$sort_key" in
+        title)     col=2; flags="f"  ;;
+        bz)        col=3; flags="f"  ;;
+        last)      col=6; flags="nr" ;;
+        container) col=5; flags="f"  ;;
+        branch|*)  col=1; flags="f"  ;;
+    esac
+
+    { head -n1 "$file"
+      tail -n +2 "$file" | LC_ALL=C sort -t $'\t' -k"${col},${col}${flags}"
+    } | awk -F'\t' -v title_width="$KD_TITLE_WIDTH" '
+        {
+            for (i = 1; i <= 5; i++) {
+                v = $i
+                if (i == 2 && NR > 1 && length(v) > title_width) {
+                    v = substr(v, 1, title_width - 1) "\xe2\x80\xa6"
+                }
+                cell[NR, i] = v
+                if (length(v) > width[i]) width[i] = length(v)
+            }
+            rows = NR
+        }
+        END {
+            reset = "\033[0m"; fgreset = "\033[39m"
+            zebra = "\033[100m"; bgreset = "\033[49m"
+            for (r = 1; r <= rows; r++) {
+                line = ""
+                for (i = 1; i <= 5; i++) {
+                    v = cell[r, i]
+                    seg = v
+                    if (r > 1 && i == 3) {
+                        color = bzcolor(v)
+                        if (color != "") seg = color v fgreset
+                    }
+                    line = line seg pad(width[i] - length(v))
+                    if (i < 5) line = line "  "
+                }
+                if (r > 1 && r % 2 == 0) print zebra line bgreset
+                else print line
+            }
+        }
+        function pad(n,    s) { s = ""; while (n-- > 0) s = s " "; return s }
+        function bzcolor(v) {
+            if (v ~ /^Pushed to/)                 return "\033[92m"
+            if (v == "Passed QA")                 return "\033[32m"
+            if (v == "Signed Off")                return "\033[36m"
+            if (v == "Needs Signoff")              return "\033[33m"
+            if (v == "Needs documenting")          return "\033[33m"
+            if (v == "ASSIGNED")                  return "\033[34m"
+            if (v == "Failed QA")                 return "\033[31m"
+            if (v ~ /^Patch do/)                  return "\033[31m"
+            if (v == "BLOCKED")                   return "\033[31m"
+            if (v == "RESOLVED")                  return "\033[90m"
+            return ""
+        }
+    '
+}
+
 cmd_list() {
     setup_env
     local bare="$KOHA_DIR/core/koha.git"
     local worktree_dir="$KOHA_DIR/core/worktrees"
     local refresh=0
-    local TITLE_WIDTH=60
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -497,7 +572,7 @@ cmd_list() {
 
     [ -d "$bare" ] || { echo "error: bare repo not found at $bare" >&2; exit 1; }
 
-    local pager=(${PAGER:-less -FSX})
+    local pager=(${PAGER:-less -FRSX})
 
     # Build worktree lookup
     declare -A wt_set
@@ -517,14 +592,17 @@ cmd_list() {
 
     # Collect local branches up front (with committer date baked into the
     # for-each-ref call, avoiding a 'git log' per branch) so we know which
-    # Bugzilla bugs to fetch.
+    # Bugzilla bugs to fetch. The unix timestamp is kept as a hidden sort
+    # key so LAST WORKED can sort chronologically, not lexically on the
+    # relative-date string.
     local branches=()
-    while IFS='|' read -r branch last_worked; do
+    while IFS='|' read -r branch last_worked epoch; do
         [ -n "$last_worked" ] || last_worked="-"
-        branches+=("$branch|$last_worked")
+        [ -n "$epoch" ] || epoch=0
+        branches+=("$branch|$last_worked|$epoch")
     done < <(git -C "$bare" for-each-ref \
         --sort=refname \
-        --format='%(refname:short)|%(committerdate:relative)' \
+        --format='%(refname:short)|%(committerdate:relative)|%(committerdate:unix)' \
         refs/heads/)
 
     local bug_ids=() bug
@@ -563,12 +641,25 @@ cmd_list() {
         done < <(printf '%s\n' "${bug_ids[@]}" | _bz_cache_get_many)
     fi
 
+    # Best-effort sweep of stale data files from earlier runs that didn't
+    # clean up after themselves — e.g. 'kd list | head' closes the pipe
+    # early, SIGPIPE kills the pager mid-stream, and under 'set -e' bash
+    # can bypass the EXIT trap below entirely rather than running it.
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'kd-list.*' -mmin +60 -delete 2>/dev/null || true
+
+    # Write the full (untruncated, uncolored) table to a temp file. Title
+    # truncation and coloring happen at render time so sorting always
+    # operates on the real values.
+    local datafile
+    datafile="$(mktemp "${TMPDIR:-/tmp}/kd-list.XXXXXX")"
+    trap "rm -f '$datafile'" EXIT
+
     {
-        printf 'BRANCH\tTITLE\tBZ\tLAST WORKED\tCONTAINER\n'
+        printf 'BRANCH\tTITLE\tBZ\tLAST WORKED\tCONTAINER\tEPOCH\n'
 
         declare -A seen_local
         for entry in "${branches[@]}"; do
-            IFS='|' read -r branch last_worked <<<"$entry"
+            IFS='|' read -r branch last_worked epoch <<<"$entry"
             seen_local["$branch"]=1
 
             local ktd="-"
@@ -587,33 +678,41 @@ cmd_list() {
             if [ -n "$bug" ]; then
                 bz_status="${bz_status_map[$bug]:-?}"
                 bz_title="${bz_title_map[$bug]:-?}"
-                [ "${#bz_title}" -gt "$TITLE_WIDTH" ] && bz_title="${bz_title:0:$((TITLE_WIDTH - 1))}…"
             else
                 bz_status="-"
                 bz_title="-"
             fi
 
-            printf '%s\t%s\t%s\t%s\t%s\n' \
-                "$branch" "$bz_title" "$bz_status" "$last_worked" "$ktd"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$branch" "$bz_title" "$bz_status" "$last_worked" "$ktd" "$epoch"
         done
 
-        # Remote-only branches
-        local remote_header_shown=0
+        # Remote-only branches, folded in as ordinary rows (epoch 0 sorts
+        # them to the bottom on a LAST WORKED sort) rather than a separate
+        # section, since a section header doesn't survive re-sorting.
         while read -r rbranch; do
             [ "${seen_local[$rbranch]+x}" ] && continue
-            if [ "$remote_header_shown" -eq 0 ]; then
-                printf '\n'
-                printf 'REMOTE-ONLY BRANCHES\t\t\t\t\n'
-                remote_header_shown=1
-            fi
-            printf '  origin/%s\t-\t-\t-\t(remote only)\n' "$rbranch"
+            printf '  origin/%s\t-\t-\t-\t(remote only)\t0\n' "$rbranch"
         done < <(git -C "$bare" for-each-ref \
             --sort=refname \
             --format='%(refname:short)' \
             refs/remotes/origin/ \
             | sed 's|^origin/||' \
             | grep -v '^HEAD$')
-    } | column -t -s $'\t' | "${pager[@]}"
+    } > "$datafile"
+
+    if command -v fzf >/dev/null 2>&1 && [ -t 1 ]; then
+        fzf --ansi --no-sort --header-lines=1 \
+            --header=$'alt-t:title  alt-b:bz  alt-l:last-worked  alt-c:container  alt-r:branch (reset)' \
+            --bind "alt-t:reload($KD_SELF _list_render $datafile title)" \
+            --bind "alt-b:reload($KD_SELF _list_render $datafile bz)" \
+            --bind "alt-l:reload($KD_SELF _list_render $datafile last)" \
+            --bind "alt-c:reload($KD_SELF _list_render $datafile container)" \
+            --bind "alt-r:reload($KD_SELF _list_render $datafile branch)" \
+            < <(cmd_list_render "$datafile" branch)
+    else
+        cmd_list_render "$datafile" branch | "${pager[@]}"
+    fi
 }
 
 cmd_proxy() {
@@ -645,6 +744,7 @@ case "$CMD" in
     logs)     [ -n "$1" ] || { echo "usage: kd logs <name>" >&2; exit 1; }
               cmd_logs "$@" ;;
     list|branches|br) cmd_list "$@" ;;
+    _list_render) cmd_list_render "$@" ;;  # internal: used by kd list's fzf reload bindings
     proxy)    cmd_proxy "$@" ;;
     -h|--help) usage ;;
     "") usage; exit 1 ;;
