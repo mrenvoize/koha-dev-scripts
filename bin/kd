@@ -15,12 +15,11 @@ Usage:
     kd up  <name> [--plugin PATH] [--plugins] [--search-engine ENGINE]
                   [--selenium] [--smtp] [--sso] [--persistent-db] [--bz] [--tmux] [--track UPSTREAM]
     kd wt  <name> [--bz] [--track UPSTREAM]
-    kd down <name> [--rm[=full]]
+    kd down <name> [--keep] [--rm=full]
     kd tmux <name>
     kd shell <name> [--root] [--run 'cmd']
     kd logs <name>
-    kd list
-    kd branches
+    kd list [--refresh]
     kd proxy [start|stop|status]
     kd -h|--help
 
@@ -30,13 +29,14 @@ Commands:
               --track UPSTREAM creates branch tracking an upstream ref (e.g. origin/master)
     wt        Create worktree only (no KTD); --bz applies the bug's patches;
               --track UPSTREAM creates branch tracking an upstream ref (e.g. origin/master)
-    down      Stop a KTD instance (--rm also removes the worktree;
-              --rm=full also deletes the branch)
+    down      Stop a KTD instance and remove its worktree (branch is kept;
+              --keep leaves the worktree in place; --rm=full also deletes the branch)
     tmux      Attach or create a tmux dev session for the feature
     shell     Drop into the KTD container shell
     logs      Follow the KTD container logs
-    list      Show worktrees and their KTD container status
-    branches  Table of local branches, worktrees, containers, and upstream tracking
+    list      Table of local branches, worktrees, containers, tracking, last-worked
+              date, and (for bug_/qa_ branches) cached Bugzilla status/title;
+              --refresh forces a fresh Bugzilla lookup. Paged with $PAGER.
     proxy     Manage the shared Traefik proxy (start|stop|status)
 
 Environment:
@@ -266,11 +266,53 @@ EOF
     fi
 }
 
-# Extracts a Bugzilla number from a branch name of the form bug_NNNNN[-suffix].
+# Extracts a Bugzilla number from a branch name of the form bug_NNNNN[-suffix]
+# or qa_NNNNN[-suffix].
 _bz_from_name() {
-    if [[ "$1" =~ bug_([0-9]+) ]]; then
-        echo "${BASH_REMATCH[1]}"
+    if [[ "$1" =~ ^(bug|qa)_([0-9]+) ]]; then
+        echo "${BASH_REMATCH[2]}"
     fi
+}
+
+# ── bugzilla cache ───────────────────────────────────────────────────────────
+
+_bz_cache_path() {
+    echo "${XDG_CACHE_HOME:-$HOME/.cache}/kd/bugzilla.json"
+}
+
+# Fetches summary/status for the given bug numbers in one batched REST call
+# and merges them into the cache. Silently leaves the cache untouched on
+# failure (offline, tracker down, ...) so callers can fall back to whatever's
+# already cached.
+_bz_fetch_batch() {
+    local ids="$1"
+    [ -n "$ids" ] || return 0
+
+    local cache
+    cache="$(_bz_cache_path)"
+    mkdir -p "$(dirname "$cache")"
+    [ -f "$cache" ] || echo '{}' > "$cache"
+
+    local resp
+    resp="$(curl -sf --max-time 10 \
+        "https://bugs.koha-community.org/bugzilla3/rest/bug?id=${ids}&include_fields=id,summary,status")" \
+        || { echo "warning: could not reach Bugzilla; using cached data" >&2; return 1; }
+
+    local fetched
+    fetched="$(jq '[.bugs[] | {(.id|tostring): {status: .status, summary: .summary}}] | add // {}' <<<"$resp")" \
+        || return 1
+
+    jq --argjson fetched "$fetched" '. + $fetched' "$cache" > "$cache.tmp" \
+        && mv "$cache.tmp" "$cache"
+}
+
+# Prints "status\ttitle" for a bug number from the cache, or two empty fields.
+_bz_cache_get() {
+    local bug="$1" cache
+    cache="$(_bz_cache_path)"
+    [ -f "$cache" ] || { printf '\t'; return; }
+    jq -r --arg id "$bug" '.[$id] | [.status // "", .summary // ""] | @tsv' "$cache" 2>/dev/null \
+        || printf '\t'
 }
 
 _format_tracking() {
@@ -355,81 +397,18 @@ cmd_wt() {
     [ -n "$bz_num" ] || echo "  kd tmux $name   # to open a dev session"
 }
 
-cmd_branches() {
-    setup_env
-    local bare="$KOHA_DIR/core/koha.git"
-    local worktree_dir="$KOHA_DIR/core/worktrees"
-
-    [ -d "$bare" ] || { echo "error: bare repo not found at $bare" >&2; exit 1; }
-
-    # Build worktree lookup
-    declare -A wt_set
-    if [ -d "$worktree_dir" ]; then
-        for wt in "$worktree_dir"/*/; do
-            [ -d "$wt" ] && wt_set["$(basename "$wt")"]=1
-        done
-    fi
-
-    printf "%-45s  %-40s  %s\n" "BRANCH" "KTD" "TRACKING"
-    printf "%-45s  %-40s  %s\n" \
-        "$(printf '%.0s-' {1..45})" \
-        "$(printf '%.0s-' {1..40})" \
-        "--------"
-
-    declare -A seen_local
-
-    while IFS='|' read -r branch upstream track; do
-        seen_local["$branch"]=1
-
-        local ktd="-"
-        if [ "${wt_set[$branch]+x}" ]; then
-            resolve_name "$branch"
-            local cname="${KTD_NAME}-koha-1"
-            local cstatus
-            cstatus="$(docker ps -a --filter "name=^${cname}$" --format '{{.Status}}' 2>/dev/null)"
-            if [ -n "$cstatus" ]; then
-                ktd="${cname} (${cstatus})"
-            else
-                ktd="(no container)"
-            fi
-        fi
-
-        local tracking
-        tracking="$(_format_tracking "$upstream" "$track")"
-        printf "%-45s  %-40s  %s\n" "$branch" "$ktd" "$tracking"
-    done < <(git -C "$bare" for-each-ref \
-        --sort=refname \
-        --format='%(refname:short)|%(upstream:short)|%(upstream:track)' \
-        refs/heads/)
-
-    # Remote-only branches
-    local remote_header_shown=0
-    while read -r rbranch; do
-        [ "${seen_local[$rbranch]+x}" ] && continue
-        if [ "$remote_header_shown" -eq 0 ]; then
-            echo ""
-            printf "%-45s  %-40s  %s\n" "REMOTE-ONLY BRANCHES" "" ""
-            remote_header_shown=1
-        fi
-        printf "%-45s  %-40s  %s\n" "  origin/$rbranch" "-" "(remote only)"
-    done < <(git -C "$bare" for-each-ref \
-        --sort=refname \
-        --format='%(refname:short)' \
-        refs/remotes/origin/ \
-        | sed 's|^origin/||' \
-        | grep -v '^HEAD$')
-}
 
 cmd_down() {
     local name="$1"; shift
     setup_env
     resolve_name "$name"
 
-    local remove_worktree="no"
+    local remove_worktree="yes"
     local remove_branch="no"
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --rm)      remove_worktree="yes"; shift ;;
+            --keep)    remove_worktree="no"; shift ;;
+            --rm)      remove_worktree="yes"; shift ;;  # now the default; kept for compatibility
             --rm=full) remove_worktree="yes"; remove_branch="yes"; shift ;;
             *) echo "unknown option: $1" >&2; exit 1 ;;
         esac
@@ -521,32 +500,120 @@ cmd_logs() {
 
 cmd_list() {
     setup_env
-
+    local bare="$KOHA_DIR/core/koha.git"
     local worktree_dir="$KOHA_DIR/core/worktrees"
-    if [ ! -d "$worktree_dir" ]; then
-        echo "no worktrees found at $worktree_dir" >&2
-        exit 1
+    local refresh=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --refresh) refresh=1; shift ;;
+            *) echo "unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    [ -d "$bare" ] || { echo "error: bare repo not found at $bare" >&2; exit 1; }
+
+    local pager=(${PAGER:-less -FSX})
+
+    # Build worktree lookup
+    declare -A wt_set
+    if [ -d "$worktree_dir" ]; then
+        for wt in "$worktree_dir"/*/; do
+            [ -d "$wt" ] && wt_set["$(basename "$wt")"]=1
+        done
     fi
 
-    printf "%-35s  %-25s  %s\n" "BRANCH" "CONTAINER" "STATUS"
-    printf "%-35s  %-25s  %s\n" \
-        "$(printf '%.0s-' {1..35})" \
-        "$(printf '%.0s-' {1..25})" \
-        "-------"
+    # Collect local branches up front so we know which Bugzilla bugs to fetch.
+    local branches=()
+    while IFS='|' read -r branch upstream track; do
+        branches+=("$branch|$upstream|$track")
+    done < <(git -C "$bare" for-each-ref \
+        --sort=refname \
+        --format='%(refname:short)|%(upstream:short)|%(upstream:track)' \
+        refs/heads/)
 
-    for worktree in "$worktree_dir"/*/; do
-        [ -d "$worktree" ] || continue
-        local branch
-        branch="$(basename "$worktree")"
-        resolve_name "$branch"
-
-        local container="${KTD_NAME}-koha-1"
-        local status
-        status="$(docker ps -a --filter "name=^${container}$" --format '{{.Status}}' 2>/dev/null)"
-        [ -z "$status" ] && status="not found"
-
-        printf "%-35s  %-25s  %s\n" "$branch" "$container" "$status"
+    local bug_ids=() bug
+    for entry in "${branches[@]}"; do
+        bug="$(_bz_from_name "${entry%%|*}")"
+        [ -n "$bug" ] && bug_ids+=("$bug")
     done
+
+    if [ "${#bug_ids[@]}" -gt 0 ]; then
+        if [ "$refresh" -eq 1 ]; then
+            _bz_fetch_batch "$(IFS=,; echo "${bug_ids[*]}")"
+        else
+            local cache missing
+            cache="$(_bz_cache_path)"
+            if [ -s "$cache" ]; then
+                missing="$(printf '%s\n' "${bug_ids[@]}" | jq -R -s -r --slurpfile c "$cache" '
+                    ($c[0]) as $cache
+                    | split("\n") | map(select(length>0))
+                    | map(select(($cache[.]) == null))
+                    | join(",")')"
+            else
+                missing="$(IFS=,; echo "${bug_ids[*]}")"
+            fi
+            [ -n "$missing" ] && _bz_fetch_batch "$missing"
+        fi
+    fi
+
+    {
+        printf 'BRANCH\tCONTAINER\tTRACKING\tLAST WORKED\tBZ\tTITLE\n'
+
+        declare -A seen_local
+        for entry in "${branches[@]}"; do
+            IFS='|' read -r branch upstream track <<<"$entry"
+            seen_local["$branch"]=1
+
+            local ktd="-"
+            if [ "${wt_set[$branch]+x}" ]; then
+                resolve_name "$branch"
+                local cname="${KTD_NAME}-koha-1"
+                local cstatus
+                cstatus="$(docker ps -a --filter "name=^${cname}$" --format '{{.Status}}' 2>/dev/null)"
+                if [ -n "$cstatus" ]; then
+                    ktd="${cname} (${cstatus})"
+                else
+                    ktd="(no container)"
+                fi
+            fi
+
+            local tracking last_worked bz_status bz_title
+            tracking="$(_format_tracking "$upstream" "$track")"
+            last_worked="$(git -C "$bare" log -1 --format=%cr "$branch" 2>/dev/null)"
+            [ -z "$last_worked" ] && last_worked="-"
+
+            bug="$(_bz_from_name "$branch")"
+            if [ -n "$bug" ]; then
+                IFS=$'\t' read -r bz_status bz_title <<<"$(_bz_cache_get "$bug")"
+                [ -z "$bz_status" ] && bz_status="?"
+                [ -z "$bz_title" ] && bz_title="?"
+            else
+                bz_status="-"
+                bz_title="-"
+            fi
+
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$branch" "$ktd" "$tracking" "$last_worked" "$bz_status" "$bz_title"
+        done
+
+        # Remote-only branches
+        local remote_header_shown=0
+        while read -r rbranch; do
+            [ "${seen_local[$rbranch]+x}" ] && continue
+            if [ "$remote_header_shown" -eq 0 ]; then
+                printf '\n'
+                printf 'REMOTE-ONLY BRANCHES\t\t\t\t\t\n'
+                remote_header_shown=1
+            fi
+            printf '  origin/%s\t-\t(remote only)\t\t\t\n' "$rbranch"
+        done < <(git -C "$bare" for-each-ref \
+            --sort=refname \
+            --format='%(refname:short)' \
+            refs/remotes/origin/ \
+            | sed 's|^origin/||' \
+            | grep -v '^HEAD$')
+    } | column -t -s $'\t' | "${pager[@]}"
 }
 
 cmd_proxy() {
@@ -569,7 +636,7 @@ case "$CMD" in
               cmd_up "$@" ;;
     wt)       [ -n "$1" ] || { echo "usage: kd wt <name> [--bz NUM]" >&2; exit 1; }
               cmd_wt "$@" ;;
-    down)     [ -n "$1" ] || { echo "usage: kd down <name> [--rm]" >&2; exit 1; }
+    down)     [ -n "$1" ] || { echo "usage: kd down <name> [--keep] [--rm=full]" >&2; exit 1; }
               cmd_down "$@" ;;
     tmux)     [ -n "$1" ] || { echo "usage: kd tmux <name>" >&2; exit 1; }
               cmd_tmux "$@" ;;
@@ -577,8 +644,7 @@ case "$CMD" in
               cmd_shell "$@" ;;
     logs)     [ -n "$1" ] || { echo "usage: kd logs <name>" >&2; exit 1; }
               cmd_logs "$@" ;;
-    list)     cmd_list ;;
-    branches|br) cmd_branches ;;
+    list|branches|br) cmd_list "$@" ;;
     proxy)    cmd_proxy "$@" ;;
     -h|--help) usage ;;
     "") usage; exit 1 ;;
