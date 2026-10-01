@@ -426,6 +426,26 @@ cmd_down() {
     echo "done."
 }
 
+# The tmux server's own process working directory is fixed once, forever,
+# at whatever directory was current when its very first session was created
+# (standard daemon behavior — nothing ever chdir()s it again). Every later
+# session's `-c <dir>` is silently ignored and falls back to that frozen
+# directory whenever the server's own cwd has gone stale — e.g. because a
+# worktree is later removed with `kd down` while it happened to be the cwd
+# that spawned the server. New panes then land in whatever that directory
+# resolves to (nowhere useful) instead of the directory actually requested.
+#
+# Guard against ever being the session that first spawns the server from a
+# worktree: make sure a session rooted at $HOME exists (idempotent — a no-op
+# once the server already has one) before creating the real feature session.
+# $HOME is never removed, so once anchored, the server's own cwd stays valid
+# for its entire lifetime regardless of how many worktrees come and go.
+ensure_tmux_anchor() {
+    tmux has-session -t _anchor 2>/dev/null \
+        || tmux new-session -d -s _anchor -c "$HOME" 2>/dev/null \
+        || true
+}
+
 cmd_tmux() {
     local name="$1"
     setup_env
@@ -436,6 +456,8 @@ cmd_tmux() {
         echo "worktree $worktree does not exist; run: kd up $name" >&2
         exit 1
     fi
+
+    ensure_tmux_anchor
 
     local session="koha-$KTD_NAME"
     if tmux has-session -t "$session" 2>/dev/null; then
