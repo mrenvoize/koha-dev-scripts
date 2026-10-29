@@ -15,6 +15,7 @@ kd tmux <name>
 kd shell <name> [--root] [--run 'cmd']
 kd logs <name>
 kd list [--refresh]
+kd prune [--older-than DAYS] [--no-containers] [-n|--dry-run] [-y|--yes]
 kd proxy [start|stop|status]
 ```
 
@@ -27,6 +28,7 @@ kd proxy [start|stop|status]
 | `kd shell` | Drop into the KTD container shell (`--root` for root, `--run 'cmd'` to run one command) |
 | `kd logs` | Follow the KTD container logs |
 | `kd list` | Table of local branches with Bugzilla title/status, last-worked date, and worktree/container status (alias: `kd branches`). See [kd list](#kd-list) |
+| `kd prune` | Reclaim disk from worktrees and KTD containers nothing uses any more. Lists the plan and asks first (`-n` only lists, `-y` skips the question). A worktree is removed only if it is **clean** (or an abandoned half-applied `git am`, which is aborted first), idle for `--older-than DAYS` (default 7), has no running KTD instance, and no process has its cwd inside it — so a worktree an agent session is working in is never pulled out from under it. Removal is never forced, and branches are never deleted. Also removes KTD containers whose worktree is gone (`--no-containers` to skip); named volumes such as `--persistent-db` are kept. Directories git no longer knows about are reported, not removed (a container may have left root-owned files in them), except ones holding only an empty `.remember/` |
 | `kd proxy` | Manage the shared Traefik proxy (started automatically by `kd up` if it isn't running) |
 
 Versioned branch names (`NN.NN.TAG`, e.g. `24.11.etf`) are automatically mapped to a Docker-safe project name (`etf24`) and the correct `KOHA_IMAGE`.

@@ -28,6 +28,7 @@ Usage:
     kd shell <name> [--root] [--run 'cmd']
     kd logs <name>
     kd list [--refresh]
+    kd prune [--older-than DAYS] [--no-containers] [-n|--dry-run] [-y|--yes]
     kd proxy [start|stop|status]
     kd -h|--help
 
@@ -52,6 +53,13 @@ Commands:
               In fzf, enter opens an action menu for the row (tab selects
               several for bulk up/down); ctrl-t = tmux, ctrl-u = up (and
               open tmux), ctrl-d = down. The list refreshes after each action.
+    prune     Remove worktrees nothing is using any more, and the KTD containers
+              left behind without one. A worktree is removed only if it is clean
+              (or an abandoned half-applied git am), idle for --older-than days
+              (default 7), has no running KTD instance and no process with its
+              cwd inside. Branches are never deleted. Lists what it will do and
+              asks first; -n only lists, -y skips the question, --no-containers
+              leaves orphaned KTD instances alone
     proxy     Manage the shared Traefik proxy (start|stop|status)
 
 Environment:
@@ -916,6 +924,241 @@ cmd_proxy() {
     esac
 }
 
+# ── prune ─────────────────────────────────────────────────────────────────────
+
+# True if any process has its cwd inside $1 (a shell, editor, agent session...).
+# Removing a directory under a live process leaves it with a dead cwd, so
+# prune never touches these.
+_wt_in_use() {
+    local dir="$1" p cwd
+    if [ -d /proc/self ]; then
+        for p in /proc/[0-9]*; do
+            cwd="$(readlink "$p/cwd" 2>/dev/null)" || continue
+            case "$cwd" in "$dir"|"$dir"/*) return 0 ;; esac
+        done
+        return 1
+    fi
+    lsof -d cwd -Fn 2>/dev/null | grep -qF "n$dir"
+}
+
+# Unix time of the worktree's last activity: the newer of its HEAD commit and
+# its index (touched by status, add, am, checkout...).
+_wt_last_activity() {
+    local wt="$1" gd commit idx
+    gd="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" || { echo 0; return; }
+    commit="$(git -C "$wt" log -1 --format=%ct 2>/dev/null || echo 0)"
+    idx="$(stat -c %Y "$gd/index" 2>/dev/null || stat -f %m "$gd/index" 2>/dev/null || echo 0)"
+    echo $(( commit > idx ? commit : idx ))
+}
+
+# KTD compose project name for a worktree/branch name.
+_ktd_name_for() {
+    ( resolve_name "$1"; echo "$KTD_NAME" )
+}
+
+# Removes every container (and anonymous volume) and network of a compose
+# project. Named volumes are left alone: --persistent-db keeps its data in one
+# on purpose.
+_prune_rm_project() {
+    local project="$1" ids
+    ids="$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)"
+    [ -z "$ids" ] || docker rm -f -v $ids >/dev/null 2>&1 || true
+    ids="$(docker network ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null)"
+    [ -z "$ids" ] || docker network rm $ids >/dev/null 2>&1 || true
+}
+
+# Classifies one worktree. Prints "<verdict>|<reason>" where verdict is one of
+#   remove       clean and idle
+#   remove-am    abandoned half-applied 'git am' (aborted first, then removed)
+#   keep         anything else; the reason says why
+# $1 worktree path  $2 name  $3 min idle days  $4 name of the running-containers set
+_prune_classify() {
+    local wt="$1" name="$2" days="$3" running="$4"
+    local gd status rc idle_days stuck_am=0 ktd f
+    local -n _running="$running"
+
+    if _wt_in_use "$wt"; then echo "keep|in use by a running process"; return; fi
+
+    ktd="$(_ktd_name_for "$name")"
+    if [ -n "${_running[$ktd-koha-1]:-}" ]; then echo "keep|KTD instance is running"; return; fi
+
+    gd="$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null)" \
+        || { echo "keep|not a usable git worktree"; return; }
+
+    # A detached HEAD whose commits no branch/tag/remote points at would be
+    # lost with the worktree.
+    if ! git -C "$wt" symbolic-ref -q HEAD >/dev/null 2>&1; then
+        if [ "$(git -C "$wt" rev-list --count HEAD --not --branches --remotes --tags 2>/dev/null || echo 1)" != 0 ]; then
+            echo "keep|detached HEAD with commits no branch points at"; return
+        fi
+    fi
+
+    if [ -d "$gd/rebase-merge" ]; then echo "keep|rebase in progress"; return; fi
+    if [ -d "$gd/rebase-apply" ]; then
+        if [ -e "$gd/rebase-apply/applying" ]; then
+            stuck_am=1
+        else
+            echo "keep|rebase in progress"; return
+        fi
+    fi
+    for f in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do
+        [ -e "$gd/$f" ] && { echo "keep|${f%_HEAD} in progress"; return; }
+    done
+
+    idle_days=$(( ( $(date +%s) - $(_wt_last_activity "$wt") ) / 86400 ))
+    if [ "$idle_days" -lt "$days" ]; then echo "keep|active ${idle_days}d ago (< ${days}d)"; return; fi
+
+    # --no-optional-locks: status must not write the index (it also fails when
+    # the disk is full, which must read as "unknown", never as "clean").
+    rc=0
+    status="$(git --no-optional-locks -C "$wt" status --porcelain 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then echo "keep|git status failed"; return; fi
+
+    if [ "$stuck_am" -eq 1 ]; then
+        # The conflicted/staged state is the am's own; anything untracked
+        # survives the abort and is caught by the non-forced remove later.
+        echo "remove-am|abandoned git am, idle ${idle_days}d"; return
+    fi
+    if [ -n "$status" ]; then
+        echo "keep|$(printf '%s\n' "$status" | wc -l | tr -d ' ') uncommitted change(s)"; return
+    fi
+    echo "remove|clean, idle ${idle_days}d"
+}
+
+cmd_prune() {
+    local days=7 yes=0 dry=0 containers=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --older-than)    days="${2:?--older-than needs a number of days}"; shift 2 ;;
+            --older-than=*)  days="${1#*=}"; shift ;;
+            -y|--yes)        yes=1; shift ;;
+            -n|--dry-run)    dry=1; shift ;;
+            --no-containers) containers=0; shift ;;
+            *) echo "usage: kd prune [--older-than DAYS] [--no-containers] [-n|--dry-run] [-y|--yes]" >&2; exit 1 ;;
+        esac
+    done
+    [[ "$days" =~ ^[0-9]+$ ]] || { echo "error: --older-than must be a whole number of days" >&2; exit 1; }
+
+    setup_env
+    local bare="$KOHA_DIR/core/koha.git"
+    local worktree_dir="$KOHA_DIR/core/worktrees"
+    [ -d "$bare" ] || { echo "error: bare repo not found at $bare" >&2; exit 1; }
+
+    git -C "$bare" worktree prune   # drop entries whose directory is already gone
+
+    declare -A running_set=() registered=() expected_projects=()
+    local cname
+    while IFS= read -r cname; do
+        [ -n "$cname" ] && running_set["$cname"]=1
+    done < <(docker ps --format '{{.Names}}' 2>/dev/null)
+
+    local wt name
+    while IFS= read -r wt; do
+        [ -n "$wt" ] && registered["$wt"]=1
+    done < <(git -C "$bare" worktree list --porcelain | sed -n 's/^worktree //p')
+
+    # ── worktrees ──
+    local plan_rm=() plan_am=() verdict reason kb total_kb=0
+    local -a keep_lines=() rm_lines=() stray=() stray_empty=()
+    if [ -d "$worktree_dir" ]; then
+        for wt in "$worktree_dir"/*/; do
+            wt="${wt%/}"; [ -d "$wt" ] || continue
+            name="$(basename "$wt")"
+            expected_projects["$(_ktd_name_for "$name")"]=1
+            if [ -z "${registered[$wt]:-}" ]; then
+                # A session's hooks can recreate .remember/ after the worktree
+                # is gone; that alone is not worth reporting, just sweep it.
+                if [ "$(ls -A "$wt" 2>/dev/null)" = ".remember" ] && [ -O "$wt" ]; then
+                    stray_empty+=("$name")
+                else
+                    stray+=("$name")
+                fi
+                continue
+            fi
+            IFS='|' read -r verdict reason < <(_prune_classify "$wt" "$name" "$days" running_set)
+            case "$verdict" in
+                remove|remove-am)
+                    kb="$(du -sk "$wt" 2>/dev/null | cut -f1)"; total_kb=$(( total_kb + ${kb:-0} ))
+                    [ "$verdict" = remove ] && plan_rm+=("$name") || plan_am+=("$name")
+                    rm_lines+=("$(printf '  remove  %-28s %6s MB  %s' "$name" "$(( ${kb:-0} / 1024 ))" "$reason")") ;;
+                *) keep_lines+=("$(printf '  keep    %-28s %s' "$name" "$reason")") ;;
+            esac
+        done
+    fi
+
+    # ── orphaned KTD instances (compose projects with no worktree) ──
+    # Only projects started from $KTD_HOME itself count, which excludes the
+    # shared proxy (KTD_HOME/proxy) and unrelated stacks.
+    local -a orphans=() orphan_lines=()
+    if [ "$containers" -eq 1 ]; then
+        local project wdir n_ctr
+        while IFS='|' read -r project wdir; do
+            [ -n "$project" ] && [ "$wdir" = "$KTD_HOME" ] || continue
+            [ -z "${expected_projects[$project]:-}" ] || continue
+            if [ -n "${running_set[$project-koha-1]:-}" ]; then continue; fi   # something is serving it
+            n_ctr="$(docker ps -aq --filter "label=com.docker.compose.project=$project" | wc -l | tr -d ' ')"
+            orphans+=("$project")
+            orphan_lines+=("$(printf '  remove  %-28s %s container(s), no worktree' "$project" "$n_ctr")")
+        done < <(docker ps -a --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u)
+    fi
+
+    echo "Worktrees ($worktree_dir), idle threshold ${days}d; branches are never deleted:"
+    [ "${#rm_lines[@]}" -eq 0 ] || printf '%s\n' "${rm_lines[@]}"
+    [ "${#keep_lines[@]}" -eq 0 ] || printf '%s\n' "${keep_lines[@]}"
+    [ "${#rm_lines[@]}" -gt 0 ] || [ "${#keep_lines[@]}" -gt 0 ] || echo "  (none)"
+    if [ "${#stray[@]}" -gt 0 ]; then
+        echo
+        echo "Directories that are no longer registered worktrees (remove by hand; may need sudo"
+        echo "if a container created root-owned files, e.g. node_modules):"
+        printf '  stray   %s\n' "${stray[@]}"
+    fi
+    if [ "$containers" -eq 1 ]; then
+        echo
+        echo "Orphaned KTD instances (named volumes, e.g. --persistent-db, are kept):"
+        if [ "${#orphan_lines[@]}" -gt 0 ]; then printf '%s\n' "${orphan_lines[@]}"; else echo "  (none)"; fi
+    fi
+    echo
+    echo "Would remove: $(( ${#plan_rm[@]} + ${#plan_am[@]} )) worktree(s) (~$(( total_kb / 1024 )) MB), ${#orphans[@]} orphaned instance(s)," \
+         "${#stray_empty[@]} leftover .remember-only dir(s)."
+
+    if [ $(( ${#plan_rm[@]} + ${#plan_am[@]} + ${#orphans[@]} + ${#stray_empty[@]} )) -eq 0 ]; then return 0; fi
+    [ "$dry" -eq 0 ] || return 0
+    if [ "$yes" -eq 0 ]; then
+        if [ -t 0 ]; then
+            local reply; read -r -p "Proceed? [y/N] " reply
+            [[ "$reply" =~ ^[Yy]$ ]] || { echo "aborted."; return 0; }
+        else
+            echo "not a terminal: pass --yes to proceed (nothing removed)."; return 0
+        fi
+    fi
+
+    local failed=0
+    for name in "${plan_am[@]}" "${plan_rm[@]}"; do
+        wt="$worktree_dir/$name"
+        if printf '%s\n' "${plan_am[@]}" | grep -qxF "$name"; then
+            git -C "$wt" am --abort >/dev/null 2>&1 \
+                || { echo "  skipped $name: git am --abort failed"; failed=1; continue; }
+        fi
+        # Not --force: if anything untracked is left, git refuses and we keep it.
+        if git -C "$bare" worktree remove "$wt" 2>/dev/null; then
+            ktd down "$(_ktd_name_for "$name")" >/dev/null 2>&1 || true
+            _prune_rm_project "$(_ktd_name_for "$name")"
+            echo "  removed $name"
+        else
+            echo "  skipped $name: not clean after all (untracked files?) — left in place"; failed=1
+        fi
+    done
+    for project in "${orphans[@]}"; do
+        _prune_rm_project "$project"
+        echo "  removed instance $project"
+    done
+    for name in "${stray_empty[@]}"; do
+        rm -rf "${worktree_dir:?}/${name:?}" && echo "  removed leftover dir $name"
+    done
+    [ "$failed" -eq 0 ] || echo "some worktrees were skipped; see above."
+    echo "done."
+}
+
 # ── dispatch ──────────────────────────────────────────────────────────────────
 
 CMD="${1:-}"
@@ -935,6 +1178,7 @@ case "$CMD" in
     logs)     [ -n "$1" ] || { echo "usage: kd logs <name>" >&2; exit 1; }
               cmd_logs "$@" ;;
     list|branches|br) cmd_list "$@" ;;
+    prune)    cmd_prune "$@" ;;
     # internal: used by kd list's fzf bindings
     _list_render) cmd_list_render "$@" ;;
     _list_build)  cmd_list_build "$@" ;;
